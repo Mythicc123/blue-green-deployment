@@ -47,7 +47,7 @@ jobs:
 
       # Install deploy scripts on EC2 (one-time setup)
       - name: Install deploy scripts on EC2
-        uses: appleboy/ssh-action@v0.40.0
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
@@ -67,7 +67,7 @@ jobs:
 
       # BG-08: Create lock acquisition script on EC2 (avoids nested heredoc issues)
       - name: Prepare lock script on EC2
-        uses: appleboy/ssh-action@v0.40.0
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
@@ -81,7 +81,7 @@ jobs:
 
       # BG-06 + BG-08: Full deploy pipeline with EC2 lock
       - name: Run blue-green deployment
-        uses: appleboy/ssh-action@v0.40.0
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
