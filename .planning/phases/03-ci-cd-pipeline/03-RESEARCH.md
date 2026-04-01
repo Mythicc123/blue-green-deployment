@@ -1,90 +1,71 @@
 # Phase 3: CI/CD Pipeline - Research
 
 **Researched:** 2026-04-01
-**Domain:** GitHub Actions Docker integration, buildx, blue-green deployment pipeline architecture
-**Confidence:** HIGH (rooted in existing project artifacts and confirmed multi-container-service patterns)
+**Domain:** GitHub Actions concurrency control, EC2 deployment locking, SSH-based CI/CD secrets management, race condition handling between CI platform and remote host
+**Confidence:** HIGH (GitHub Actions concurrency well-documented platform behavior); MEDIUM (EC2 locking patterns, cross-platform specifics)
 
 ---
 
 ## Summary
 
-Phase 3 automates the blue-green deployment pipeline via GitHub Actions. The pipeline must: (1) build and push the Docker image to Docker Hub, (2) SSH into the EC2 instance to deploy the new image to the inactive slot, (3) wait for the health check to pass, (4) switch Nginx to point at the new slot, and (5) run a smoke test through the public IP. The core design question -- build on the GitHub runner vs. build on EC2 -- is resolved in favor of building on the runner: it keeps secrets off the server, gives better CI visibility, and costs no more given that the runner must push to Docker Hub regardless.
+Phase 3 wraps the Phase 2 manual scripts into a GitHub Actions workflow that runs on push to main. The core challenge is concurrency control: preventing two simultaneous runs from deploying to the same inactive slot at the same time, and ensuring a cancelled run does not leave the EC2 in a corrupted state. The solution requires two independent locking mechanisms that cooperate: a GitHub Actions `concurrency:` block at the platform level, and an EC2-side lock file as a secondary guard and a record of what process holds the deployment slot.
 
-**Primary recommendation:** Multi-job pipeline with `build-and-push` -> `deploy`, passing the image tag between jobs via `GITHUB_OUTPUT` + `outputs:`. Use `docker/setup-buildx-action` only if multi-arch images are needed (likely not for single-architecture x86 EC2). The `appleboy/ssh-action` v0.40.0 drives all EC2 operations. Concurrency protection is two-layer: GitHub Actions `concurrency` group (first line) + `flock /tmp/blue-green-deploy.lock` on EC2 (second line).
+The critical design insight is that GitHub Actions concurrency and the EC2 lock file serve different purposes. GitHub concurrency prevents multiple runs from starting on the same branch/ref. The EC2 lock file prevents a deployment from proceeding when another process (GitHub Actions, a human, a cron job) is already mid-deploy. Both are required because: (a) the EC2 lock file survives GitHub runner restarts (runners are ephemeral), and (b) the EC2 lock file is the only mechanism that can record who holds the lock and when it was acquired.
+
+**Primary recommendation:** Use `concurrency: ${{ github.repository }}` with `cancel-in-progress: true`. This cancels any in-progress run when a new push arrives. On the EC2 side, use a TTL-bearing lock file at `/tmp/blue-green-deploy.lock` with flock(1) for atomic acquisition, a 10-minute TTL for staleness detection, and a hostname+PID+timestamp in the file content so stale locks are diagnosable.
 
 ---
 
-## User Constraints (from CONTEXT.md)
+## User Constraints (from STATE.md / Phase 2 Research)
 
 ### Locked Decisions
 
-- Shared MongoDB: Both blue and green use the existing multi-container-service MongoDB (port 27017). Migrations must be backward-compatible.
-- Keep old slot: Both environments stay running after switch. Rollback is instant Nginx reload.
-- Same EC2 instance: Blue-green runs on 13.236.205.122 alongside multi-container-service.
-- IP only: No domain/R53 for v1.
-- Basic monitoring: Health checks, container logs, Nginx logs only.
-- Blue-green state file: `/var/run/blue-green-state` contains `blue` or `green`.
-- Concurrency lock required: GitHub Actions concurrency group + EC2 lock file (`/tmp/blue-green-deploy.lock`).
-- Immutable Docker image tags: `sha-{git_sha}` format (e.g., `sha-abc1234`), never `latest`.
+- SSH host: `ubuntu@13.236.205.122`
+- SSH key: `$HOME/.ssh/ec2-static-site-key.pem`
+- Docker image: `mythicc123/multi-container-service`
+- Compose dirs: `/opt/blue/`, `/opt/green/`
+- Blue port: 3001, green port: 3002
+- Nginx config names: `blue-green-blue.conf`, `blue-green-green.conf`
+- Symlink path: `/etc/nginx/sites-enabled/blue-green`
+- State file: `/var/run/blue-green-state` contains `blue` or `green`
+- Immutable image tags: git SHA-based, never `latest`
+- Health endpoint: `localhost:<port>/health` returns `{"status":"ok","mongo":"connected"}`
+- Shared MongoDB: `multi-container-service-mongo-1:27017`
+- Existing scripts: `deploy.sh`, `health-check.sh`, `switch-nginx.sh`, `rollback.sh`, `run-deploy.sh`, `get-active-slot.sh`
+- Smoke test: call GET/POST/PUT/DELETE API endpoints through the public IP after Nginx switch
+- No automated rollback on failure; manual rollback via `rollback.sh`
 
-### Claude's Discretion
-
-- Pipeline structure: job count, step ordering, artifact passing mechanism.
-- Docker buildx: use or skip, cache strategy.
-- Where Docker build happens: GitHub runner vs. EC2.
-- Workflow file location and inline vs. script-referencing SSH commands.
-
-### Deferred Ideas (OUT OF SCOPE)
-
-- Separate MongoDB per environment.
-- Canary traffic splitting.
-- Automated rollback on failure (manual rollback only for v1).
-- Kubernetes/EKS.
-- Prometheus/Grafana.
-- Domain/Route53.
-- Separate EC2 instance.
-- GitOps.
-- Database migrations as a separate pipeline step.
-
----
-
-## Phase Requirements
+### Phase 3 Requirements (from REQUIREMENTS.md)
 
 | ID | Description | Research Support |
 |----|-------------|------------------|
-| BG-06 | Automated pipeline on push to main -- determine active slot, deploy to inactive, health check, Nginx switch, smoke test | Pipeline step sequence, `appleboy/ssh-action`, SSH heredoc pattern |
-| BG-07 | Immutable Docker image tags -- git SHA (e.g., `sha-abc1234`), never `latest` | `docker/build-push-action` with `${{ github.sha }}` tag |
-| BG-08 | Concurrency lock -- GitHub Actions concurrency group + EC2 lock file | `concurrency:` YAML block, `flock` on `/tmp/blue-green-deploy.lock` |
-| BG-09 | Smoke test after switch -- call Todo API endpoints (GET/POST/PUT/DELETE) via public IP | `curl` commands in SSH step, Todo API endpoint inventory |
-| BG-11 | Old slot stays alive after switch | Architecture constraint, already implemented in scripts |
+| BG-06 | Automated CI/CD pipeline on push — GitHub Actions `deploy.yml` triggers on push to main. Steps: determine active slot, deploy to inactive slot, health check, Nginx switch, smoke test | Workflow YAML structure, step ordering |
+| BG-07 | Immutable Docker image tags — images tagged with git SHA (e.g., `sha-abc1234`), never `latest` | `GITHUB_SHA` env var, image tagging in build-push-action |
+| BG-08 | Concurrency lock — GitHub Actions concurrency group prevents simultaneous deployments. Deployment lock file on EC2 (`/tmp/blue-green-deploy.lock`) as secondary protection | `concurrency:` YAML block, EC2 lock via flock(1) + TTL |
+| BG-09 | Smoke test after switch — CI/CD calls Todo API endpoints (GET/POST/PUT/DELETE) through the public IP after Nginx switch | curl-based smoke test against public IP, Todo API endpoints |
 
 ---
 
 ## Standard Stack
 
 ### Core
-
-| Library | Version | Purpose | Why Standard |
-|---------|---------|---------|--------------|
-| `docker/login-action` | v3 | Authenticate to Docker Hub in CI | Official GitHub Actions action; handles credential storage in GitHub secrets |
-| `appleboy/ssh-action` | v0.40.0 | Execute remote SSH commands on EC2 | De facto standard for GitHub Actions SSH; handles key injection, timeout, and multiple commands cleanly |
-| `docker/build-push-action` | v6 | Build and push Docker image | Industry standard; supports `cache-from: type=gha`, multi-tag, provenance |
-| `docker/setup-buildx-action` | v3 | Enable Docker BuildKit | Only needed for multi-arch images; skip for x86-only single-architecture deployment |
-| `docker/metadata-action` | v5 | Generate Docker tags from git metadata | Produces `${{ github.sha }}` and `latest` tags; integrates with build-push |
+| Tool | Version | Purpose | Why Standard |
+|------|---------|---------|--------------|
+| GitHub Actions | N/A (platform) | CI/CD orchestration | GitHub-native, triggers on push, first-class concurrency support |
+| `GITHUB_SHA` | N/A (built-in env var) | Immutable Docker image tag | Unique per commit, reproducible, never ambiguous like `latest` |
+| `appleboy/ssh-action` | v0.40.0 (2024-08) | Execute remote SSH commands on EC2 | De facto standard; handles key injection, timeout, `if: always()` steps |
+| `docker/build-push-action` | v6 | Build and push Docker image | Industry standard; supports cache-from GHA, multi-tag |
+| `docker/setup-buildx-action` | v3 | Docker buildx for multi-platform builds | Required for build-push-action if using GHA cache |
+| `docker/login-action` | v3 | Authenticate to Docker Hub | Required for pushing to Docker Hub org repos |
+| flock(1) | util-linux 2.38+ (Ubuntu 22.04) | Atomic lock acquisition on EC2 | Standard Linux tool; supersedes noclobber redirect |
+| bash | 5.1+ (Ubuntu 22.04) | Lock script execution | Already used by all Phase 2 scripts |
 
 ### Supporting
-
-| Library | Version | Purpose | When to Use |
-|---------|---------|---------|-------------|
-| `actions/checkout` | v4 | Checkout repository for workflow access | Always -- needed for `GITHUB_SHA` context |
-| `docker/setup-qemu-action` | v3 | QEMU for multi-platform builds | Only if building ARM64 images alongside AMD64 |
-
-**Installation:** No manual install needed -- these are GitHub Actions marketplace actions referenced by `uses:` in the workflow YAML. Runner-side tools (jq, httpie) can be installed via `apt-get` in a run step.
-
-```bash
-# Runner-side tools (ubuntu-latest has docker pre-installed)
-sudo apt-get update && sudo apt-get install -y jq httpie
-```
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `EC2_SSH_KEY` | Repository secret for SSH private key | Passed to `appleboy/ssh-action` inline key parameter |
+| `EC2_HOST` | Repository secret for SSH target host | `13.236.205.122` as GitHub Actions secret |
+| `mkdir`-based lock | Alternative to flock if flock unavailable | Simpler, equally atomic, no fd management |
 
 ---
 
@@ -96,166 +77,660 @@ sudo apt-get update && sudo apt-get install -y jq httpie
 blue-green-deployment/
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml              # CI/CD pipeline (NEW)
-├── app/
-│   └── Dockerfile                  # COPY from multi-container-service/app/Dockerfile (NEW)
-├── compose/
-│   ├── blue/
-│   │   └── docker-compose.yml      # Already exists
-│   └── green/
-│       └── docker-compose.yml      # Already exists
+│       └── deploy.yml          # Main CI/CD pipeline
 ├── scripts/
-│   ├── deploy.sh                  # Phase 2 reference
-│   ├── health-check.sh             # Phase 2 reference
-│   ├── switch-nginx.sh             # Phase 2 reference
-│   └── run-deploy.sh               # Phase 2 orchestrator -- mirror this logic in deploy.yml
-└── .env.blue.template
+│   ├── deploy.sh               # Phase 2: docker pull + compose up on EC2
+│   ├── health-check.sh         # Phase 2: polling health check
+│   ├── switch-nginx.sh         # Phase 2: Nginx switch + state update
+│   ├── rollback.sh              # Phase 2: rollback to previous slot
+│   ├── run-deploy.sh            # Phase 2: orchestrator
+│   ├── get-active-slot.sh       # Phase 2: read /var/run/blue-green-state
+│   └── ec2-lock.sh             # NEW: EC2-side lock with TTL
+└── compose/
+    ├── blue/docker-compose.yml
+    └── green/docker-compose.yml
 ```
 
-**Note on `app/Dockerfile`:** The Dockerfile lives in `multi-container-service/app/Dockerfile`. For the blue-green pipeline to build the image independently, copy it to `blue-green-deployment/app/Dockerfile`. Alternatively, use `context: ../multi-container-service` if the CI runner has access to the sibling directory (requires the runner to clone both repos).
+**Key principle:** The GitHub Actions workflow uses `appleboy/ssh-action` to run the Phase 2 scripts (`run-deploy.sh`) as a single step, with environment variables injected. The `ec2-lock.sh` script is called inline within the SSH action to acquire and release the lock around the deploy.
 
-### Pattern 1: Build on GitHub Runner (RECOMMENDED)
+---
 
-**Decision:** Build on the GitHub runner, not on EC2.
+## Research Question 1: GitHub Actions Concurrency Groups
 
-**Rationale:**
-1. **Secrets stay in CI:** The Docker Hub credentials (`DOCKERHUB_TOKEN`) never touch EC2. If the EC2 server is compromised, no registry credentials are exposed.
-2. **CI visibility:** Build logs, layer cache hits, and push status are visible in GitHub's UI without SSHing into EC2.
-3. **Cost equivalence:** Either way, the runner must push to Docker Hub (or EC2 must pull from it). The network egress from the runner to Docker Hub is equivalent to EC2 pulling from Docker Hub. No advantage to building on EC2.
-4. **Simpler EC2:** The EC2 instance only runs `docker compose pull` and `docker compose up` -- minimal complexity on the server.
-
-**Trade-off acknowledged:** A large Docker image (500MB+) pushed from the runner then pulled by EC2 uses runner egress bandwidth. Building on EC2 would use EC2's bandwidth instead. For a typical Node.js app (<200MB compressed), this is negligible. For very large images, consider building on EC2.
-
-### Pattern 2: Two-Job Pipeline with `outputs:` for Tag Passing
-
-**Decision:** Split into `build-and-push` and `deploy` jobs.
-
-**Why not single job:**
-- The image tag (`sha-${{ github.sha }}`) computed in a single job would be stable because `github.sha` is a context variable, not a file-based computation. A single job works fine.
-- However, a two-job structure is cleaner: `build-and-push` is the "build" concern; `deploy` is the "operate" concern. They have different failure modes and retry logic.
-- The `outputs:` mechanism (writing to `$GITHUB_OUTPUT`) is the correct way to pass data between jobs.
+### Recommended YAML Configuration
 
 ```yaml
-# Job 1: Build and push
-build-and-push:
-  outputs:
-    image_tag: sha-${{ github.sha }}
-  steps:
-    - uses: actions/checkout@v4
-    - uses: docker/setup-buildx-action@v3   # skip if single-arch amd64
-    - uses: docker/login-action@v3
-    - uses: docker/build-push-action@v6
-
-# Job 2: Deploy
-deploy:
-  needs: build-and-push
-  steps:
-    - uses: appleboy/ssh-action@v0.40.0
-      with:
-        script: |
-          docker compose pull mythicc123/multi-container-service:${{ needs.build-and-push.outputs.image_tag }}
-```
-
-**Note on `appleboy/ssh-action` vs `appleboy/ssh-agent-action`:** Both exist. `ssh-action` (v0.40.0) embeds the key and runs commands directly in the action YAML. `ssh-agent-action` sets up `SSH_AUTH_SOCK` so subsequent shell `ssh` commands work. Use `ssh-action` for simplicity; it handles key injection internally.
-
-### Pattern 3: Docker Buildx -- Skip for Single-Arch
-
-**Decision:** `docker/setup-buildx-action` is only needed when building multi-arch images (e.g., amd64 + arm64 simultaneously) or when the runner's Docker does not support the `type=gha` cache backend.
-
-For this project:
-- The EC2 instance is x86_64 (Amazon Linux / Ubuntu on x86)
-- The Docker Hub image is likely already amd64
-- Only one architecture needs to be built
-
-**When to enable buildx:**
-```yaml
-- uses: docker/setup-buildx-action@v3
-  # No conditional needed if always building multi-arch
-```
-
-**When to skip it (simpler):** Remove `docker/setup-buildx-action` entirely. The runner's Docker daemon (on `ubuntu-latest`) uses BuildKit by default in recent GitHub Actions images. If `type=gha` cache is needed, buildx is required. If not, skip it.
-
-**Context7 note:** As of 2025, `ubuntu-latest` runners include Docker BuildKit enabled by default. `type=gha` cache backend requires buildx. So: if using `cache-from: type=gha`, keep buildx. If using no cache or `type=local` cache, skip buildx.
-
-### Pattern 4: Concurrency Control -- Two-Layer Defense (BG-08)
-
-**Layer 1: GitHub Actions `concurrency` block**
-```yaml
+# .github/workflows/deploy.yml
 concurrency:
-  group: blue-green-deploy-${{ github.ref }}
+  group: ${{ github.repository }}
   cancel-in-progress: true
 ```
-- Cancels any in-flight run when a new push arrives to the same ref
-- First line of defense -- stops the runner from starting a second job
 
-**Layer 2: EC2 `flock` lock file**
-```bash
-# Acquire lock (atomic, blocks until acquired or timeout)
-flock -n /tmp/blue-green-deploy.lock -c "echo $$ > /tmp/blue-green-deploy.lock" \
-  || { echo "ERROR: Another deployment in progress"; exit 1; }
+### Group Name: `${{ github.repository }}` vs Alternatives
 
-# ... deployment steps ...
+| Group Name | Cancels same branch | Cancels cross-branch | Use Case |
+|------------|--------------------|----------------------|----------|
+| `${{ github.repository }}` | YES | YES | Single deploy target (one EC2). Any run cancels any other run. |
+| `${{ github.workflow }}-${{ github.ref }}` | YES | NO | Multi-environment (prod + staging). This project has one target. |
+| `${{ github.run_id }}` | NO | N/A | No concurrency control — not recommended. |
+| Literal string `"blue-green-deploy"` | YES | YES | Works but hardcoded; repository-scoped is more idiomatic. |
 
-# Release lock (in always-run step)
-rm -f /tmp/blue-green-deploy.lock
+**Recommendation:** `${{ github.repository }}` because there is one deployment target. Any push to any branch cancels any other in-progress run.
+
+### `cancel-in-progress: true` vs Letting It Queue
+
+| Setting | Behavior | Pros | Cons |
+|---------|----------|------|------|
+| `cancel-in-progress: true` | In-progress run cancelled when new run starts | Fresh code always deploys; no stale deploys queueing | Cancelled run may leave EC2 in intermediate state |
+| `cancel-in-progress: false` (omitted) | New run waits for in-progress run to complete | Guaranteed no overlap; ordered queue | Slow to respond to rapid pushes; queues pile up |
+
+**Recommendation: `cancel-in-progress: true`** with TTL-based EC2 lock cleanup.
+
+### What Happens to an In-Progress Run When GitHub Concurrency Cancels It
+
+When GitHub cancels an in-progress run (because a new push arrived):
+
+1. GitHub sends a cancellation signal to the runner. The runner marks the job as `cancelled`.
+2. **GitHub Actions does NOT run any `if:` cleanup steps or `finally:` blocks by default.** The job stops at whatever step it was on.
+3. Any SSH commands already dispatched to EC2 will complete on the remote side (EC2 does not know the runner was cancelled).
+4. The EC2-side effects depend on what step the run was in:
+   - Before lock acquired: no EC2 state change
+   - Lock acquired, mid-deploy: lock held until TTL expires (no harm done)
+   - After Nginx switch: Nginx routes to new slot, state file updated, but old container still running — this is actually fine (Phase 2 architecture keeps both environments alive)
+
+**Critical implication:** If a run is cancelled mid-deploy, the EC2 lock remains held. The TTL is the mandatory recovery mechanism. Without a TTL, the next run would block forever waiting for a lock held by a dead runner.
+
+---
+
+## Research Question 2: EC2 Deployment Lock File
+
+### Why flock(1) Over noclobber Redirect
+
+| Approach | Atomic? | Supports Waiting? | Timeout Possible? | Recommended |
+|----------|---------|-------------------|-------------------|-------------|
+| `set -C; echo $$ > lockfile` (noclobber) | Partial (TOCTOU between test and write) | NO — fails immediately | NO | NO |
+| `flock(1)` | YES (kernel advisory lock) | YES — can block waiting | YES — `flock -w SECONDS` | YES |
+| `ln(1)` (symlink) | YES (atomic symlink creation) | NO — fails immediately | Requires polling loop | Alternative |
+| `mkdir(1)` (directory as lock) | YES (atomic mkdir) | NO — fails immediately | Requires polling loop | Alternative |
+| `touch + test` | NO — TOCTOU race | N/A | N/A | NO |
+
+**Recommendation: flock(1).** It is:
+- Available on Ubuntu 22.04 by default (util-linux package)
+- Atomic at the kernel level (POSIX advisory lock)
+- Supports timeout with `flock -w SECONDS`
+- Supports release on script exit via EXIT trap
+- Built-in wait semantics — no busy-polling loop needed
+
+### Lock File Location
+
+**Path:** `/tmp/blue-green-deploy.lock`
+
+Rationale: `/tmp` is world-writable by the ubuntu user, survives reboots, and is not persisted across EC2 instance replacement. Using `/var/run/` is equivalent but requires sudo. `/tmp` requires no special permissions.
+
+### Lock File Content Schema
+
+Store structured data in the lock file for diagnosability:
+
 ```
-- `flock -n` (non-blocking) fails immediately if lock is held
-- Protects against CI-vs-manual races (e.g., someone SSHes in and deploys manually while CI is running)
-- The `if: always()` on the release step ensures the lock is cleaned up even if earlier steps fail
+LOCK_HELD=1
+PID=<pid>
+HOSTNAME=<ec2-hostname>
+ACQUIRED_AT=<ISO8601 timestamp>
+GITHUB_RUN_ID=<run id or "local">
+GITHUB_RUN_URL=<run url or "-">
+TTL_AT=<ISO8601 timestamp when lock expires>
+```
 
-**Why both layers:** The `concurrency` block handles CI-vs-CI races. The EC2 lock handles CI-vs-manual races. Both are needed for BG-08 compliance.
+Example:
+```
+LOCK_HELD=1
+PID=12345
+HOSTNAME=ip-10-0-1-42
+ACQUIRED_AT=2026-04-01T12:00:00Z
+GITHUB_RUN_ID=1234567890
+GITHUB_RUN_URL=https://github.com/your-org/your-repo/actions/runs/1234567890
+TTL_AT=2026-04-01T12:10:00Z
+```
 
-### Pattern 5: SSH Heredoc Safety (Confirmed from Phase 2 Scripts)
-
-**Source:** `deploy.sh` line 32 and `switch-nginx.sh` line 21 both use the quoted-delimiter heredoc pattern correctly.
+### Recommended Lock Script: `scripts/ec2-lock.sh`
 
 ```bash
-# WRONG -- local shell expands $tag before SSH
-ssh ubuntu@$HOST bash <<EOF
-  DOCKER_IMAGE=$tag docker compose pull
+#!/usr/bin/env bash
+# scripts/ec2-lock.sh — EC2-side deployment lock management
+# Usage:
+#   ./ec2-lock.sh acquire  # Acquire lock (blocks until available or timeout)
+#   ./ec2-lock.sh release  # Release lock (only if held by us)
+#   ./ec2-lock.sh status   # Check if locked (exit 0=free, exit 1=held)
+#   ./ec2-lock.sh cleanup  # Remove stale locks (TTL expired)
+
+set -euo pipefail
+
+LOCKFILE="/tmp/blue-green-deploy.lock"
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-300}"   # 5 minutes — max wait for lock
+LOCK_TTL="${LOCK_TTL:-600}"          # 10 minutes — stale after this
+HOSTNAME=$(hostname)
+
+CMD="${1:-}"
+[[ -z "$CMD" ]] && { echo "Usage: $0 acquire|release|status|cleanup" >&2; exit 1; }
+
+acquire() {
+    local run_id="${GITHUB_RUN_ID:-local}"
+    local run_url="${GITHUB_RUN_URL:--}"
+    local ttl_at now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ttl_at=$(date -u -d "+${LOCK_TTL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Atomic acquire using flock. -w TIMEOUT waits TIMEOUT seconds for the lock.
+    (
+        flock -w "$LOCK_TIMEOUT" 9 || {
+            echo "ERROR: Could not acquire lock within ${LOCK_TIMEOUT}s" >&2
+            echo "Lock held by:" >&2
+            cat "$LOCKFILE" 2>/dev/null | grep -E '^(PID|GITHUB_RUN_ID|TTL_AT)=' >&2 || echo "  (lock file unreadable)" >&2
+            exit 1
+        }
+
+        # Check if existing lock is stale before overwriting
+        if [[ -f "$LOCKFILE" ]]; then
+            local existing_ttl
+            existing_ttl=$(grep '^TTL_AT=' "$LOCKFILE" | cut -d= -f2 || echo "")
+            if [[ -n "$existing_ttl" && "$existing_ttl" > "$now" ]]; then
+                echo "ERROR: Lock is actively held (TTL: ${existing_ttl})" >&2
+                cat "$LOCKFILE" >&2
+                exit 1
+            fi
+            # Lock is stale — safe to overwrite
+        fi
+
+        cat > "$LOCKFILE" <<EOF
+LOCK_HELD=1
+PID=$$
+HOSTNAME=${HOSTNAME}
+ACQUIRED_AT=${now}
+GITHUB_RUN_ID=${run_id}
+GITHUB_RUN_URL=${run_url}
+TTL_AT=${ttl_at}
 EOF
+        echo "LOCK ACQUIRED: PID=$$ TTL_AT=${ttl_at}"
+    ) 9>"$LOCKFILE"
+}
 
-# RIGHT -- remote shell expands $tag
-ssh ubuntu@$HOST bash -s -- "$tag" << 'REMOTE'
-  DOCKER_IMAGE=$1 docker compose pull
-REMOTE
+release() {
+    if [[ ! -f "$LOCKFILE" ]]; then
+        echo "LOCK NOT HELD: no lock file"
+        return 0
+    fi
+
+    local lock_pid
+    lock_pid=$(grep '^PID=' "$LOCKFILE" | cut -d= -f2 || echo "")
+
+    if [[ "$lock_pid" != "$$" ]]; then
+        echo "WARNING: Lock held by PID $lock_pid, not $$ — not releasing" >&2
+        return 1
+    fi
+
+    rm -f "$LOCKFILE"
+    echo "LOCK RELEASED"
+}
+
+status() {
+    if [[ ! -f "$LOCKFILE" ]]; then
+        echo "LOCK STATUS: FREE"
+        return 0
+    fi
+
+    local ttl_at now
+    ttl_at=$(grep '^TTL_AT=' "$LOCKFILE" | cut -d= -f2 || echo "")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if [[ -n "$ttl_at" && "$ttl_at" < "$now" ]]; then
+        echo "LOCK STATUS: STALE (TTL expired at ${ttl_at})"
+        return 2   # Distinct exit code for stale
+    fi
+
+    echo "LOCK STATUS: HELD"
+    grep -E '^(PID|HOSTNAME|ACQUIRED_AT|GITHUB_RUN_ID|TTL_AT)=' "$LOCKFILE"
+    return 1
+}
+
+cleanup() {
+    if [[ ! -f "$LOCKFILE" ]]; then
+        echo "CLEANUP: no lock file"
+        return 0
+    fi
+
+    local ttl_at now
+    ttl_at=$(grep '^TTL_AT=' "$LOCKFILE" | cut -d= -f2 || echo "")
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if [[ -n "$ttl_at" && "$ttl_at" < "$now" ]]; then
+        echo "CLEANUP: removing stale lock (TTL expired at ${ttl_at})"
+        rm -f "$LOCKFILE"
+    else
+        echo "CLEANUP: lock is not stale (TTL: ${ttl_at:-unknown}) — skipping"
+    fi
+}
+
+case "$CMD" in
+    acquire) acquire ;;
+    release) release ;;
+    status)  status ;;
+    cleanup) cleanup ;;
+    *) echo "Unknown command: $CMD" >&2; exit 1 ;;
+esac
 ```
 
-**In `appleboy/ssh-action`:** Variables are injected via `envs:` and referenced directly in `script:`. Do NOT use heredocs -- use direct shell variable references:
+**Key design decisions:**
+
+1. **Atomic flock + content write:** The flock acquisition and file content write happen inside the same `flock` block (file descriptor 9). This ensures that even if the process crashes between acquiring the lock and writing the content, the lock is at least held and the next run will see it (and clean it if stale).
+
+2. **TTL checked inside flock:** The stale-lock check happens inside the critical section. This prevents a race where two runs both see a stale lock simultaneously and both try to clean it.
+
+3. **Distinct exit codes:** `acquire` exits 0 on success, 1 on timeout/failure. `status` exits 0 if free, 1 if held, 2 if stale. These codes allow callers to distinguish states programmatically.
+
+4. **GITHUB_RUN_ID and GITHUB_RUN_URL injected by workflow:** These environment variables are set by the workflow YAML before calling the lock script, enabling human-readable lock diagnostics.
+
+### flock Advisory Lock Semantics
+
+`flock(1)` is an advisory lock — cooperating processes must use it. Any process that bypasses flock can corrupt the lock file. In a controlled environment (only the GitHub Actions runner uses this lock), advisory locking is sufficient.
+
+### TTL Selection
+
+| TTL | Pros | Cons |
+|-----|------|------|
+| 5 minutes | Quick recovery from crashed runner | Might expire during slow docker pull on large images |
+| **10 minutes** | Covers slow image pulls (~2-3 GB on slow connection) | 10-minute gap before retry on lock contention |
+| 30 minutes | Very safe for large images | Long delay on lock contention |
+
+**Recommendation: 10 minutes (600 seconds).** Worst-case deploy: docker pull (~2-5 min) + compose up (~10s) + health polling (60s) + Nginx switch (~5s) = ~7 minutes. 10 minutes gives buffer.
+
+**Lock wait timeout (`LOCK_TIMEOUT`):** 5 minutes. If the lock is actively held, wait up to 5 minutes before giving up. Combined with 10-minute TTL, this means: worst-case wait = 5 minutes (waiting) + (TTL of dead lock) = up to 15 minutes.
+
+---
+
+## Research Question 3: Race Condition Between GitHub Concurrency and EC2 Lock
+
+### Scenario 1: GitHub Cancels In-Progress Run, EC2 Lock Was Acquired
+
+| Time | GitHub Runner | EC2 State |
+|------|-------------|-----------|
+| T+0 | Run A starts, acquires EC2 lock | Lock: Run A, TTL=T+10min |
+| T+60 | New push arrives, GitHub cancels Run A | Lock: Run A (still held) |
+| T+60 | Run A's SSH command still running (docker pull) | Lock: Run A |
+| T+120 | Run B starts, tries to acquire lock | Lock: Run A (not yet expired) |
+| T+120 | Run B blocks waiting for lock (flock -w 300s) | Lock: Run A |
+| T+180 | Run A's lock TTL expires | Lock: Run A (stale) |
+| T+180 | Run B's flock acquires the (now stale) lock | Lock: Run B |
+| T+180 | Run B proceeds with deployment | Lock: Run B |
+
+**Outcome:** Run B waits for up to 5 minutes, then detects the stale lock and proceeds. No data corruption. Deployment eventually succeeds.
+
+### Scenario 2: Runner Dies (Process Killed) Mid-Deploy
+
+| Time | Event | EC2 State |
+|------|-------|-----------|
+| T+0 | Run A acquires lock, starts docker pull | Lock: Run A, TTL=T+10min |
+| T+5 | Runner process killed (OOM, SIGKILL, hardware failure) | Lock: Run A (held, orphaned) |
+| T+10 | TTL expires | Lock: Run A (stale) |
+| T+10+ | Run B starts, cleans stale lock, acquires, deploys | Lock: Run B |
+
+**Outcome:** Same as Scenario 1. TTL is the recovery mechanism for runner death.
+
+### Scenario 3: EC2 Lock Acquired But SSH Command Fails Immediately
+
+| Time | Event |
+|------|-------|
+| T+0 | Run A acquires lock, then SSH fails on host key check |
+| T+0 | Run A exits with error, lock held, TTL=T+10min |
+| T+10 | Lock expires |
+| T+10+ | Run B proceeds |
+
+**Outcome:** Clean. The lock holds for 10 minutes as a safety margin even for immediate failures.
+
+### How the New Run Cleans Stale Locks
+
+At the start of every deployment run, before acquiring the lock:
+
 ```yaml
-- uses: appleboy/ssh-action@v0.40.0
+# Clean stale locks at the start of every run
+- name: Clean stale deployment locks
+  uses: appleboy/ssh-action@v0.40.0
   with:
+    host: ${{ secrets.EC2_HOST }}
+    username: ubuntu
+    key: ${{ secrets.EC2_SSH_KEY }}
+    script: |
+      LOCK_TIMEOUT=300 LOCK_TTL=600 \
+        GITHUB_RUN_ID=${{ github.run_id }} \
+        GITHUB_RUN_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} \
+        bash -s cleanup
+    timeout: 30s
+```
+
+The `cleanup` command reads the TTL in the lock file, compares it to now, and removes the file if expired.
+
+### Handling Cancelled Mid-Step EC2 State
+
+If a run is cancelled by GitHub concurrency during the Nginx switch step:
+
+1. **State file already updated:** `/var/run/blue-green-state` says the new slot is active.
+2. **Nginx already reloaded:** Traffic routes to the new slot.
+3. **Old container still running:** The previous slot's container is still running (Phase 2 architecture: both stay alive).
+
+**Result:** The cancelled run actually succeeded from the user's perspective. The new run will detect the state file already reflects the new slot, calculate the correct inactive slot, and deploy the next version to it. No special recovery needed.
+
+### Recovery Time Summary
+
+| Failure Mode | Detection | Recovery |
+|-------------|-----------|----------|
+| Cancelled run (GitHub concurrency) | Next run sees lock held | Waits up to LOCK_TIMEOUT (5 min), then cleans stale TTL |
+| Runner crash mid-deploy | TTL expiry (10 min) | Next run cleans stale lock |
+| EC2 unreachable | Lock acquisition fails immediately | Human intervention |
+
+---
+
+## Research Question 4: GitHub Actions Secrets Management
+
+### Repository Secrets to Configure
+
+| Secret Name | Value | Notes |
+|------------|-------|-------|
+| `EC2_SSH_KEY` | Full private key PEM content (including `-----BEGIN OPENSSH PRIVATE KEY-----` through `-----END OPENSSH PRIVATE KEY-----`) | Multi-line secret. Pass to `appleboy/ssh-action` inline key parameter |
+| `EC2_HOST` | `13.236.205.122` | Could vary per environment |
+| `DOCKER_USERNAME` | Docker Hub username | For `docker/login-action` |
+| `DOCKER_PASSWORD` | Docker Hub password or access token | For `docker/login-action` |
+
+### SSH Key Setup with `appleboy/ssh-action`
+
+`appleboy/ssh-action` accepts the raw private key content directly in the YAML, avoiding the need to write it to disk:
+
+```yaml
+- name: Deploy to EC2
+  uses: appleboy/ssh-action@v0.40.0
+  with:
+    host: ${{ secrets.EC2_HOST }}
+    username: ubuntu
+    key: ${{ secrets.EC2_SSH_KEY }}
     script: |
       set -euo pipefail
-      cd /opt/$INACTIVE_SLOT
-      docker compose pull
-    envs: INACTIVE_SLOT
+      echo "Running on $(hostname)"
+      # ... deployment commands ...
+    envs: IMAGE_TAG
+    timeout: 10m
 ```
 
-### Pattern 6: Docker Context Path (Critical -- Sibling Repo)
+**Advantages over raw `ssh` in a `run:` step:**
+- No manual key setup step needed (no `chmod 600` on Linux, no ssh-agent on Windows)
+- Handles `StrictHostKeyChecking=no` automatically
+- Supports `envs:` to inject workflow variables into the remote shell
+- Supports `if: always()` steps cleanly for lock release
+- Handles timeout and retry
 
-**The problem:** The `blue-green-deployment` repo and `multi-container-service` repo are siblings on disk. The Dockerfile lives in `multi-container-service/app/Dockerfile`, not in `blue-green-deployment`. The `docker/build-push-action` defaults to the runner's `$GITHUB_WORKSPACE` as the build context.
+### Alternative: Direct file write (for Linux runners that need explicit key file)
 
-**Options:**
-
-| Option | Complexity | Trade-off |
-|--------|-----------|-----------|
-| Copy Dockerfile to `blue-green-deployment/app/` | Low | Keeps repos independent; must sync Dockerfile manually |
-| Clone `multi-container-service` inside CI | Medium | Both repos available; extra `git clone` step; slight network cost |
-| `context: ../multi-container-service` (from runner workspace) | Low | Works if runner has sibling directory; fragile if runner workspace layout changes |
-
-**Recommended:** Copy `app/Dockerfile` (and any needed source files) into `blue-green-deployment/app/`. This makes the pipeline fully self-contained and independent of the sibling repo. Document that the Dockerfile must be kept in sync with `multi-container-service`.
-
-Alternatively, add this step before the build:
 ```yaml
-- name: Clone application source
+- name: Configure SSH key
   run: |
-    git clone --depth=1 https://github.com/mythicc123/multi-container-service.git ../multi-container-service
-- name: Build and push
-  uses: docker/build-push-action@v6
+    mkdir -p ~/.ssh
+    echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
+    chmod 600 ~/.ssh/ec2_key
+  shell: bash
+```
+
+**Requirements:**
+- Runner OS: Linux (ubuntu-latest) — `chmod 600` works on ext4/XFS
+- Private key: No passphrase (CI/CD runners cannot interactively provide passphrases)
+
+### Alternative: ssh-agent (for Windows runners)
+
+```yaml
+- name: Configure SSH agent
+  run: |
+    eval "$(ssh-agent -s)"
+    ssh-add - <<< "${{ secrets.EC2_SSH_KEY }}"
+    echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
+  shell: bash
+```
+
+Use this if the runner is Windows-based (NTFS does not honor chmod).
+
+### Security Notes
+
+1. **Private key must be unencrypted (no passphrase).** CI/CD runners cannot interactively provide passphrases.
+2. **Dedicated deploy key recommended.** Generate a new SSH key pair specifically for GitHub Actions deployments:
+   ```bash
+   ssh-keygen -t ed25519 -N '' -C "github-actions-blue-green-deploy" -f deploy_key
+   ```
+   Add the public key to the EC2 instance's `~/.ssh/authorized_keys` for the ubuntu user.
+3. **Limit key permissions on EC2:** Use `command=` in `authorized_keys` to restrict the deploy key to only allow the commands needed:
+   ```
+   command="/home/ubuntu/validate-deploy.sh",no-pty,no-agent-forwarding ssh-ed25519 AAAA... github-actions-blue-green-deploy
+   ```
+
+---
+
+## Common Pitfalls
+
+### Pitfall 1: Cancelled Run Leaves EC2 Lock Without TTL
+**What goes wrong:** Lock acquired but runner cancelled before TTL written. Next run blocks forever.
+**How to avoid:** Write the TTL into the lock file atomically with the acquire (both inside the flock critical section). The `ec2-lock.sh` acquire function writes TTL atomically inside the flock block.
+
+### Pitfall 2: Runner Runs on Windows (GitHub-hosted)
+**What goes wrong:** `chmod 600 ~/.ssh/ec2_key` is a no-op on Windows (NTFS). SSH refuses the key with "UNPROTECTED PRIVATE KEY FILE".
+**How to avoid:** Use `appleboy/ssh-action` (which handles key injection internally), or use the ssh-agent approach for Windows runners.
+
+### Pitfall 3: Lock Released Before Deploy Complete
+**What goes wrong:** `release()` called in a trap that fires during a long-running docker pull. Next run acquires lock and starts deploying to the same slot.
+**How to avoid:** Call `release()` only after the full deploy pipeline completes. Use `appleboy/ssh-action` with an explicit `if: always()` release step at the end of the job, not an inline trap.
+
+### Pitfall 4: Image Tag Collision
+**What goes wrong:** Run A builds image tagged `sha-abc1234`. Run B builds `sha-def4567` after Run A is cancelled. Which image is in the compose file?
+**How to avoid:** Use `GITHUB_SHA` as the image tag. Concurrency group ensures only one run is active at a time. Each run builds exactly one image with exactly one tag derived from the triggering commit.
+
+### Pitfall 5: `latest` Tag Used Instead of SHA
+**What goes wrong:** `docker pull mythicc123/multi-container-service:latest` pulls a stale cached image.
+**How to avoid:** Always use `${{ github.sha }}` as the tag. Never use `latest` in the deploy pipeline. Push `latest` separately for convenience but never consume it.
+
+### Pitfall 6: Lock Acquisition Without Stale Detection
+**What goes wrong:** A new run acquires the lock and overwrites a stale lock that belonged to a dead runner. But the dead runner's docker compose processes are still running and conflicting.
+**How to avoid:** After acquiring a stale lock, the new run should verify the EC2 state is consistent before proceeding. Specifically: check if docker compose for the inactive slot is running and if so, stop it before starting a new deploy.
+
+---
+
+## Code Examples
+
+### Complete GitHub Actions Workflow: `.github/workflows/deploy.yml`
+
+```yaml
+name: Deploy to EC2 (Blue-Green)
+
+on:
+  push:
+    branches:
+      - main
+
+# BG-08: Prevent concurrent deployments. cancel-in-progress: true cancels
+# any in-progress run when a new push arrives — the latest code always wins.
+# Using ${{ github.repository }} groups all runs in one bucket.
+concurrency:
+  group: ${{ github.repository }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_IMAGE: mythicc123/multi-container-service
+
+jobs:
+  deploy:
+    name: Blue-Green Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Docker Setup ──────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ── Build & Push Immutable SHA-Tagged Image (BG-07) ────────────
+      # Tag with GITHUB_SHA so each deploy is reproducible and immutable.
+      # Image: mythicc123/multi-container-service:sha-a1b2c3d4e5f6...
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Deploy via appleboy/ssh-action ──────────────────────────────
+      # appleboy/ssh-action handles SSH key injection inline — no manual
+      # key setup step needed. It supports envs: for variable injection
+      # and timeout for long-running commands.
+      - name: Run blue-green deployment
+        uses: appleboy/ssh-action@v0.40.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            # BG-08: Export lock context for traceability
+            export GITHUB_RUN_ID=${{ github.run_id }}
+            export GITHUB_RUN_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            export LOCK_TIMEOUT=300
+            export LOCK_TTL=600
+
+            # BG-08: Clean stale locks before starting (defense-in-depth)
+            # Removes any lock from a previously crashed/cancelled run.
+            # Write lock script inline — avoids needing it pre-installed on EC2.
+            /bin/bash << 'LOCKSCRIPT'
+            LOCKFILE="/tmp/blue-green-deploy.lock"
+            LOCK_TTL="${LOCK_TTL:-600}"
+            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            ttl_at=$(grep '^TTL_AT=' "$LOCKFILE" 2>/dev/null | cut -d= -f2 || echo "")
+            if [[ -n "$ttl_at" && "$ttl_at" < "$now" ]]; then
+              echo "Removing stale lock (TTL expired: ${ttl_at})"
+              rm -f "$LOCKFILE"
+            fi
+            LOCKSCRIPT
+
+            # BG-08: Acquire EC2 lock with traceability
+            echo "Acquiring deployment lock..."
+            (
+              flock -w 300 9 || { echo "ERROR: Could not acquire lock within 300s"; exit 1; }
+              now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              ttl_at=$(date -u -d "+${LOCK_TTL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+              cat > "$LOCKFILE" <<EOF
+LOCK_HELD=1
+PID=$$
+HOSTNAME=$(hostname)
+ACQUIRED_AT=${now}
+GITHUB_RUN_ID=${GITHUB_RUN_ID:-local}
+GITHUB_RUN_URL=${GITHUB_RUN_URL:--}
+TTL_AT=${ttl_at}
+EOF
+              echo "LOCK ACQUIRED: PID=$$ TTL_AT=${ttl_at}"
+            ) 9>/tmp/blue-green-deploy.lock
+
+            # BG-06: Run the full deploy pipeline (reuses Phase 2 scripts)
+            # IMAGE_TAG must match the tag pushed above
+            IMAGE_TAG=sha-${{ github.sha }} bash /tmp/deploy/run-deploy.sh
+            DEPLOY_STATUS=$?
+
+            # BG-08: Release lock — only if deploy succeeded.
+            # On deploy failure, lock is NOT released — TTL will clean it.
+            if [[ $DEPLOY_STATUS -eq 0 ]]; then
+              rm -f /tmp/blue-green-deploy.lock
+              echo "LOCK RELEASED"
+            else
+              echo "WARNING: Deploy failed (exit $DEPLOY_STATUS) — lock NOT released (TTL will clean it)"
+            fi
+
+            exit $DEPLOY_STATUS
+          envs: IMAGE_TAG
+          timeout: 10m
+
+      # NOTE: run-deploy.sh must be pre-installed on EC2 at /tmp/deploy/run-deploy.sh.
+      # This can be done in a setup step before the deploy, or baked into the EC2 AMI.
+      # Setup step (run once):
+      #
+      # - name: Install deploy scripts on EC2
+      #   uses: appleboy/ssh-action@v0.40.0
+      #   with:
+      #     host: ${{ secrets.EC2_HOST }}
+      #     username: ubuntu
+      #     key: ${{ secrets.EC2_SSH_KEY }}
+      #     script: |
+      #       sudo mkdir -p /tmp/deploy
+      #       # SCP or heredoc each script to /tmp/deploy/
+      #     timeout: 30s
+
+      # ── Smoke Test (BG-09) ─────────────────────────────────────────
+      # BG-09: Call Todo API endpoints through the public IP after Nginx switch.
+      - name: Smoke test API endpoints
+        run: |
+          sleep 5
+          HOST_IP="${{ secrets.EC2_HOST }}"
+          echo "Testing API at http://${HOST_IP}"
+
+          # GET — should return 200 with array
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${HOST_IP}/api/todos)
+          if [[ "$HTTP_CODE" != "200" ]]; then echo "GET /api/todos failed: $HTTP_CODE"; exit 1; fi
+          echo "GET /api/todos: OK ($HTTP_CODE)"
+
+          # POST — create a todo
+          RESPONSE=$(curl -s -X POST http://${HOST_IP}/api/todos \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"ci-smoke-test-$(date +%s)\",\"done\":false}")
+          echo "POST /api/todos: $RESPONSE"
+
+          # PUT — update the created todo (extract id)
+          TODO_ID=$(echo "$RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+          if [[ -n "$TODO_ID" ]]; then
+            PUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+              http://${HOST_IP}/api/todos/${TODO_ID} \
+              -H "Content-Type: application/json" \
+              -d '{"text":"ci-smoke-test-updated","done":true}')
+            echo "PUT /api/todos/${TODO_ID}: $PUT_CODE"
+
+            # DELETE — clean up
+            DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+              http://${HOST_IP}/api/todos/${TODO_ID})
+            echo "DELETE /api/todos/${TODO_ID}: $DEL_CODE"
+          fi
+
+          echo ""
+          echo "SMOKE TEST: ALL PASSED"
+        shell: bash
+```
+
+### Verifying flock Availability on EC2 (Pre-flight Check)
+
+```bash
+# Add to workflow before deployment step
+- name: Verify flock is available on EC2
+  uses: appleboy/ssh-action@v0.40.0
   with:
-    context: ../multi-container-service/app
-    file: ../multi-container-service/app/Dockerfile
+    host: ${{ secrets.EC2_HOST }}
+    username: ubuntu
+    key: ${{ secrets.EC2_SSH_KEY }}
+    script: |
+      if command -v flock > /dev/null 2>&1; then
+        echo "flock: OK ($(flock --version | head -1))"
+      else
+        echo "ERROR: flock not found on EC2 — install with: sudo apt-get install -y util-linux"
+        exit 1
+      fi
+    timeout: 30s
 ```
 
 ---
@@ -264,512 +739,86 @@ Alternatively, add this step before the build:
 
 | Problem | Don't Build | Use Instead | Why |
 |---------|-------------|-------------|-----|
-| SSH execution in CI | Custom curl-to-SSH-API | `appleboy/ssh-action@v0.40.0` | Handles key injection, timeout, retry, and multiline script quoting correctly |
-| Docker build/push | `docker build && docker push` in `run:` step | `docker/build-push-action@v6` | Handles `type=gha` cache, multi-tag, layer push, and provenance attestation |
-| Docker Hub auth | Store credentials as plain env vars | `docker/login-action@v3` | Handles Docker config JSON, secret masking, logout on cleanup |
-| Image metadata tags | Manual string concatenation | `docker/metadata-action@v5` or inline tags array | Produces consistent `${{ github.sha }}` and `latest` tags |
-| Concurrency prevention | Polling or webhook-based locking | GitHub Actions `concurrency` + `flock` | First-class CI support (cancels in-flight) + filesystem-level lock |
-| Deployment mutex | Custom file with `test -f` | `flock -n` | Atomic; no race between test-and-create |
-
-**Key insight:** The entire CI/CD pipeline is built from first-party or widely-adopted GitHub Actions. The only shell fragment that needs to be hand-written is the `flock` lock acquisition (5 lines) and the smoke test curl commands (15 lines).
-
----
-
-## Common Pitfalls
-
-### Pitfall 1: Lock file not released on failure
-**What goes wrong:** If a deploy step fails mid-run, the SSH session may be interrupted before the lock release step runs. Subsequent CI runs block forever waiting for the lock.
-**How to avoid:** Use `if: always()` on the lock-release step. Also consider adding a lock timeout (e.g., auto-release after 30 minutes):
-```yaml
-- name: Release deployment lock
-  if: always()
-  uses: appleboy/ssh-action@v0.40.0
-  with:
-    script: rm -f /tmp/blue-green-deploy.lock
-```
-
-### Pitfall 2: Image SHA tag does not exist on Docker Hub
-**What goes wrong:** Blue-green pipeline pulls `...:<sha>` that multi-container-service has not yet pushed. Race condition when multi-container-service build is slower than blue-green deploy.
-**How to avoid:** Build and push the image in the blue-green pipeline itself (not rely on multi-container-service's pipeline). This guarantees the tag exists. Alternatively, add a `docker pull` retry loop:
-```bash
-for i in 1 2 3 4 5; do
-  docker pull "$DOCKER_IMAGE" && break
-  echo "Pull failed, retry $i..."
-  sleep 10
-done
-```
-
-### Pitfall 3: Wrong Docker context path
-**What goes wrong:** `docker/build-push-action` uses the repo root as context by default. The Dockerfile is in `../multi-container-service/app/Dockerfile` (sibling directory), not in `blue-green-deployment/`.
-**How to avoid:** Explicitly set `context:` and `file:` to point to the correct location. Document this in comments.
-
-### Pitfall 4: `latest` tag used for deployment instead of SHA
-**What goes wrong:** `docker pull mythicc123/multi-container-service:latest` may pull a stale image from a previous deploy. After two deploys, `latest` points to the newer SHA, but rollback to the older version is impossible without knowing the old SHA.
-**How to avoid:** The `.env` file on EC2 always uses the SHA tag. `latest` is pushed as a convenience alias but is never used by the deploy pipeline.
-
-### Pitfall 5: Smoke test fires before Nginx has reloaded
-**What goes wrong:** Nginx `reload` is near-instant but not zero-latency. First smoke test request may hit the old backend.
-**How to avoid:** Add `sleep 5` between the Nginx switch step and the smoke test. Reference: `run-deploy.sh` line 54 already does this.
-
-### Pitfall 6: Concurrency cancellation during active deploy
-**What goes wrong:** Push B arrives while Push A's deploy is in progress. Push A's run is cancelled by GitHub Actions, but Push A's EC2 operations may continue briefly (cancellation is async and not instant for running SSH sessions).
-**How to avoid:** The EC2 `flock` lock is the authoritative guard. Push B will block on the lock until Push A releases it (or times out at 30 minutes). This is defense-in-depth.
-
-### Pitfall 7: SSH key path mismatch in CI
-**What goes wrong:** Scripts reference `$HOME/.ssh/ec2-static-site-key.pem` which does not exist on the GitHub runner.
-**How to avoid:** Store the private key as a GitHub Actions secret (`EC2_SSH_PRIVATE_KEY`) and pass it to `appleboy/ssh-action`'s `key:` parameter. The action handles in-memory key injection.
-
----
-
-## Code Examples
-
-### Full Workflow: `.github/workflows/deploy.yml`
-
-```yaml
-# .github/workflows/deploy.yml
-name: Blue-Green Deploy
-
-on:
-  push:
-    branches: [main]
-
-# BG-08: Layer 1 concurrency -- cancels in-flight runs
-concurrency:
-  group: blue-green-deploy-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  IMAGE_NAME: mythicc123/multi-container-service
-  EC2_HOST: 13.236.205.122
-
-jobs:
-  # ─────────────────────────────────────────────────────────────────
-  # Job 1: Build and push Docker image to Docker Hub
-  # ─────────────────────────────────────────────────────────────────
-  build-and-push:
-    name: Build and Push
-    runs-on: ubuntu-latest
-    outputs:
-      image_tag: sha-${{ github.sha }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Clone application source
-        # The multi-container-service repo contains the Dockerfile and app code.
-        # Clone it so the build context can find it.
-        run: |
-          git clone --depth=1 https://github.com/mythicc123/multi-container-service.git ../multi-container-service
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        # SKIP this step if you do not need multi-arch or GHA cache.
-        # Keep it if using `type=gha` cache below.
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata for Docker
-        uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ../multi-container-service/app
-          file: ../multi-container-service/app/Dockerfile
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ─────────────────────────────────────────────────────────────────
-  # Job 2: Deploy via SSH, health check, Nginx switch, smoke test
-  # ─────────────────────────────────────────────────────────────────
-  deploy:
-    name: Deploy to EC2
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq httpie
-
-      # BG-08: Layer 2 lock -- atomic lock acquisition on EC2
-      - name: Acquire deploy lock on EC2
-        uses: appleboy/ssh-action@v0.40.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            if flock -n /tmp/blue-green-deploy.lock -c "echo $$ > /tmp/blue-green-deploy.lock"; then
-              echo "Lock acquired (PID: $(cat /tmp/blue-green-deploy.lock))"
-            else
-              echo "ERROR: Another deployment is in progress at /tmp/blue-green-deploy.lock"
-              exit 1
-            fi
-        timeout: 30s
-
-      # BG-06: Determine active slot and compute inactive slot
-      - name: Determine active slot
-        id: slot
-        uses: appleboy/ssh-action@v0.40.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            ACTIVE=$(cat /var/run/blue-green-state 2>/dev/null || echo blue)
-            if [[ "$ACTIVE" == "blue" ]]; then
-              INACTIVE=green; PORT=3002
-            else
-              INACTIVE=blue; PORT=3001
-            fi
-            echo "active=$ACTIVE" >> $GITHUB_OUTPUT
-            echo "inactive=$INACTIVE" >> $GITHUB_OUTPUT
-            echo "port=$PORT" >> $GITHUB_OUTPUT
-            echo "Active: $ACTIVE, Deploying to: $INACTIVE (port $PORT)"
-        timeout: 30s
-
-      # BG-06: Deploy image to inactive slot
-      - name: Deploy to inactive slot
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          INACTIVE: ${{ steps.slot.outputs.inactive }}
-        uses: appleboy/ssh-action@v0.40.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            cd /opt/$INACTIVE
-            # Update DOCKER_IMAGE in .env to the new SHA-tagged image
-            sed -i "s|^DOCKER_IMAGE=.*|DOCKER_IMAGE=mythicc123/multi-container-service:$IMAGE_TAG|" .env
-            echo "Pulling mythicc123/multi-container-service:$IMAGE_TAG"
-            docker compose pull
-            docker compose up -d
-            echo "Deployed $IMAGE_TAG to /opt/$INACTIVE"
-        timeout: 300s
-
-      # BG-03: Health check polling before switch
-      - name: Health check inactive slot
-        env:
-          PORT: ${{ steps.slot.outputs.port }}
-        run: |
-          url="http://localhost:$PORT/health"
-          timeout=60 interval=3 waited=0
-          echo "Polling $url (timeout: ${timeout}s)..."
-          while true; do
-            response=$(curl -sf "$url") && echo "$response" | grep -q '"status":"ok"'
-            if [[ $? -eq 0 ]]; then
-              echo "PASS: Health check passed after ${waited}s"
-              echo "$response"
-              exit 0
-            fi
-            if [[ $waited -ge $timeout ]]; then
-              echo "FAIL: Health check timed out after ${timeout}s"
-              exit 1
-            fi
-            echo "  [${waited}s] Not ready..."
-            sleep $interval
-            waited=$((waited + interval))
-          done
-        timeout: 120s
-
-      # BG-06: Switch Nginx to inactive slot (now the active slot)
-      - name: Switch Nginx
-        env:
-          INACTIVE: ${{ steps.slot.outputs.inactive }}
-        uses: appleboy/ssh-action@v0.40.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            echo "Switching Nginx to $INACTIVE..."
-            sudo ln -sf /etc/nginx/sites-available/blue-green-${INACTIVE}.conf \
-              /etc/nginx/sites-enabled/blue-green
-            sudo nginx -t
-            sudo nginx -s reload
-            echo "$INACTIVE" | sudo tee /var/run/blue-green-state > /dev/null
-            echo "Switched. State: $(cat /var/run/blue-green-state)"
-        timeout: 60s
-
-      # BG-09: Smoke test -- GET /health
-      - name: Smoke test GET /health
-        env:
-          EC2_HOST: ${{ env.EC2_HOST }}
-        run: |
-          sleep 5  # Settle time for Nginx
-          http --check-status "http://$EC2_HOST/health" \
-            | jq '.status == "ok"' || exit 1
-        timeout: 30s
-
-      # BG-09: Smoke test -- POST /todos
-      - name: Smoke test POST /todos
-        env:
-          EC2_HOST: ${{ env.EC2_HOST }}
-        run: |
-          RESPONSE=$(http --check-status --body \
-            POST "http://$EC2_HOST/todos" \
-            title="CI smoke test $(date +%s)" \
-            completed=false \
-            Content-Type:application/json)
-          echo "$RESPONSE" | jq -e '.title != null' || exit 1
-          echo "$RESPONSE" | jq -r '.._id' | tee /tmp/smoke_todo_id.txt
-        timeout: 30s
-
-      # BG-09: Smoke test -- PUT /todos/:id
-      - name: Smoke test PUT /todos
-        env:
-          EC2_HOST: ${{ env.EC2_HOST }}
-        run: |
-          TODO_ID=$(cat /tmp/smoke_todo_id.txt)
-          http --check-status --body \
-            PUT "http://$EC2_HOST/todos/$TODO_ID" \
-            title="CI smoke updated" \
-            completed=true \
-            Content-Type:application/json \
-            | jq -e '.completed == true' || exit 1
-        timeout: 30s
-
-      # BG-09: Smoke test -- DELETE /todos/:id
-      - name: Smoke test DELETE /todos
-        env:
-          EC2_HOST: ${{ env.EC2_HOST }}
-        run: |
-          TODO_ID=$(cat /tmp/smoke_todo_id.txt)
-          http --check-status --body \
-            DELETE "http://$EC2_HOST/todos/$TODO_ID"
-        timeout: 30s
-
-      # BG-08: Release lock -- always runs, even on failure (if: always())
-      - name: Release deploy lock
-        if: always()
-        uses: appleboy/ssh-action@v0.40.0
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          script: |
-            rm -f /tmp/blue-green-deploy.lock
-            echo "Lock released"
-        timeout: 30s
-```
-
-### Tag Strategy (BG-07)
-
-```yaml
-# Primary immutable tag: sha-{git_sha} -- this is what EC2 pulls
-tags: |
-  mythicc123/multi-container-service:sha-${{ github.sha }}
-  mythicc123/multi-container-service:latest   # convenience alias, never used for deploy
-
-# On EC2 .env file -- ALWAYS use SHA:
-DOCKER_IMAGE=mythicc123/multi-container-service:sha-abc1234
-```
-
-### Concurrency Lock (BG-08) -- Both Layers
-
-```yaml
-# Layer 1: Runner-side concurrency group
-concurrency:
-  group: blue-green-deploy-${{ github.ref }}
-  cancel-in-progress: true
-
-# Layer 2: Server-side flock (first SSH step in deploy job)
-- uses: appleboy/ssh-action@v0.40.0
-  with:
-    script: |
-      flock -n /tmp/blue-green-deploy.lock -c "echo $$ > /tmp/blue-green-deploy.lock" \
-        || { echo "Another deployment in progress"; exit 1; }
-```
-
-### Environment Variables vs Shell Variables
-
-```yaml
-# GitHub Actions context variables (set once, used everywhere)
-env:
-  IMAGE_NAME: mythicc123/multi-container-service
-  EC2_HOST: 13.236.205.122
-
-# Passed to appleboy/ssh-action via envs: attribute
-envs: IMAGE_TAG,INACTIVE
-
-# Inside ssh-action script: reference directly as shell variables
-script: |
-  set -euo pipefail
-  cd /opt/$INACTIVE
-  sed -i "s|^DOCKER_IMAGE=.*|DOCKER_IMAGE=mythicc123/multi-container-service:$IMAGE_TAG|" .env
-```
-
-**`github.sha` vs `github.event.pull_request.number`:**
-- `github.sha`: Full 40-character commit SHA. Use for immutable tags. `sha-abc1234abc1234abc1234` is unique and reproducible.
-- `github.event.pull_request.number`: Pull request number. Use only for temporary test tags on PR branches.
-- For `main` branch deploys: `github.sha` is correct.
-
----
-
-## State of the Art
-
-| Old Approach | Current Approach | When Changed | Impact |
-|--------------|------------------|--------------|--------|
-| `azure/docker-login` | `docker/login-action@v3` | ~2022 | Official GitHub Actions replacement; better credential handling |
-| `docker/build-push-action@v4` | `docker/build-push-action@v6` | 2024 | Native GHA cache (`type=gha`), provenance attestation |
-| `docker/setup-docker-wrap` | `docker/setup-buildx-action@v3` | 2023 | Builds BuildKit into runner; required for `type=gha` cache |
-| `appleboy/ssh-action` v0.38.x | v0.40.0 | 2024-08 | Timeout improvements, bug fixes |
-| Heredoc without quoting | `<< 'REMOTE'` (quoted delimiter) | Known pitfall | Prevents local variable expansion in SSH heredocs |
-| Raw `ssh -i` without agent | `appleboy/ssh-action` | ~2021 | In-memory key injection; no key file needed on runner |
-
-**Deprecated/outdated:**
-- `docker/metadata-action@v4` -- use v5 (same API, security fixes)
-- `azure/docker-login` -- replaced by `docker/login-action`
-- Raw `ssh -i $HOME/.ssh/key.pem` in CI -- replaced by `appleboy/ssh-action`
+| Concurrency control | Custom job queue or external mutex service | GitHub Actions `concurrency:` block | First-class platform support; no external service needed |
+| Lock file atomicity | `set -C` + redirect (no timeout, no waiting) | flock(1) with `-w TIMEOUT` | Built-in timeout, kernel-level atomicity |
+| SSH key management | Manual `echo $SECRET > file` without permissions | `appleboy/ssh-action` with inline key | Handles key injection, permissions, and quoting correctly |
+| Stale lock detection | PID-only check | TTL timestamp in lock file + `date -u` comparison | Works across runner restarts; PID-only check fails when runner dies |
+| Lock recovery | Manual intervention | TTL + cleanup at start of next run | Automatic recovery within LOCK_TTL seconds |
 
 ---
 
 ## Open Questions
 
-1. **Where does the Dockerfile live for blue-green pipeline builds?**
-   - What we know: multi-container-service has `app/Dockerfile`. Blue-green is a separate repo.
-   - What's unclear: Is the `multi-container-service` directory a git submodule of `blue-green-deployment`, a sibling checked out separately, or will the CI pipeline clone it on demand?
-   - Recommendation: Add a `git clone --depth=1` step in the CI before the Docker build, pointing to `context: ../multi-container-service/app`. This keeps the blue-green repo clean and ensures the Dockerfile is always current.
+1. **Where does the lock script (`ec2-lock.sh`) live on EC2?**
+   - What we know: Scripts need to be accessible at `/tmp/deploy/` on the EC2 instance.
+   - What's unclear: Should it be installed at provisioning time (e.g., in a Terraform user_data script), or uploaded by a setup step in the workflow?
+   - Recommendation: Install via a pre-deployment workflow step that runs `appleboy/ssh-action` to write the script to `/tmp/deploy/ec2-lock.sh` before the main deploy step. This keeps the script under version control in the repo.
 
-2. **Docker buildx for single-arch x86 EC2?**
-   - What we know: The EC2 instance runs x86_64. The Docker Hub image is likely already amd64.
-   - What's unclear: Is the existing image multi-arch (amd64 + arm64) or single-arch?
-   - Recommendation: Check the existing Docker Hub image manifest (`docker manifest inspect mythicc123/multi-container-service`). If single-arch amd64, skip `docker/setup-buildx-action`. If multi-arch is desired, enable buildx and add `platforms: linux/amd64`.
+2. **What SSH key algorithm to use?**
+   - What we know: The existing EC2 key is likely RSA (based on `ec2-static-site-key.pem` naming from multi-container-service).
+   - What's unclear: Whether the existing key can be reused or needs to be regenerated.
+   - Recommendation: Check the existing key algorithm (`ssh-keygen -l -f ec2_key.pem`). If RSA-2048+, reuse it. If RSA-1024 or older, regenerate with ED25519.
 
-3. **Docker Hub token scope for CI?**
-   - What we know: `docker/login-action` requires username + password/token.
-   - What's unclear: Should the token be a personal access token or an organization robot account?
-   - Recommendation: Use a Docker Hub Access Token (not password) scoped to the `mythicc` organization. Create at `hub.docker.com/settings/security`. Store as `DOCKERHUB_TOKEN` in GitHub Actions secrets.
+3. **Should `appleboy/ssh-action` or raw `ssh` in a `run:` step be used?**
+   - What we know: `appleboy/ssh-action` handles key injection inline, supports `if: always()`, and supports `envs:` variable passing.
+   - Recommendation: Use `appleboy/ssh-action` for the main deployment step. Write the lock script inline within the script block to avoid needing it pre-installed on EC2.
 
-4. **GitHub Actions secrets inventory:**
-   - What we know: The workflow needs `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `EC2_SSH_PRIVATE_KEY`, and optionally `EC2_HOST` (or hardcode as a `var`).
-   - What's unclear: Are all secrets already set in the repository?
-   - Recommendation: Before planning, audit existing secrets in the GitHub repo settings. Missing secrets will block CI on first run.
-
-5. **Docker context path on GitHub runner:**
-   - What we know: `blue-green-deployment` and `multi-container-service` are sibling directories. The runner's working directory is `$GITHUB_WORKSPACE` (blue-green-deployment repo root).
-   - What's unclear: Does `../multi-container-service` exist on the runner filesystem at runtime?
-   - Recommendation: Add `git clone --depth=1 https://github.com/mythicc123/multi-container-service.git ../multi-container-service` as a workflow step before the Docker build. This is the safest and most explicit approach.
+4. **How to handle the runner crash scenario?**
+   - What we know: The EC2 TTL (10 min) is the recovery mechanism, but 10 minutes may be too long for a production outage.
+   - Recommendation: Start with 10-minute TTL. If it proves problematic, add a CloudWatch alarm on the lock file's mtime, or a cron job on the EC2 that removes locks older than 5 minutes. Phase 3.x material.
 
 ---
 
 ## Environment Availability
 
-> Step 2.6: SKIPPED (GitHub Actions runners provide all required tools; EC2 dependencies verified by Phase 1/2)
+> Step 2.6: SKIPPED — no external tool dependencies beyond GitHub Actions platform and existing EC2 infrastructure.
 
-**Runner-side tools** (provided by GitHub Actions `ubuntu-latest`):
+Phase 3 adds:
+- GitHub Actions runner (`ubuntu-latest` — Linux, pre-installed tools)
+- `appleboy/ssh-action` v0.40.0 — marketplace action, downloaded at runtime
+- `docker/build-push-action` v6 — marketplace action
+- `flock(1)` on EC2 — verify with `command -v flock` on the actual EC2 instance
+- No new package installations on EC2 required for Phase 3
 
-| Tool | Pre-installed | Version |
-|------|--------------|---------|
-| Docker | Yes | Latest (runner image) |
-| Git | Yes | 2.x |
-| bash | Yes | 5.x |
-| jq | No | Install via apt |
-| httpie | No | Install via pip/apt |
-| SSH key on disk | No | Use `appleboy/ssh-action` with inline key |
+**Pre-flight check to include in plan:**
+```bash
+ssh ubuntu@$EC2_HOST 'command -v flock && echo "flock OK" || echo "MISSING"'
+```
 
-**EC2-side tools** (per Phase 1/2 verified state):
-
-| Tool | Status |
-|------|--------|
-| Docker | Installed and running |
-| Docker Compose v2 | `docker compose` available |
-| Nginx | Running with `blue-green-blue.conf` and `blue-green-green.conf` |
-| `/opt/blue/` and `/opt/green/` | Provisioned directories |
-| `/var/run/blue-green-state` | Writable state file |
-| `/tmp/blue-green-deploy.lock` | Lock file path available |
-| `multi-container-service_default` Docker network | External network available |
-
----
-
-## Validation Architecture
-
-> Skip this section if `workflow.nyquist_validation` is explicitly `false` in `.planning/config.json`.
-
-**Status:** `nyquist_validation` key absent from `.planning/config.json` -- validation section included per default.
-
-### Test Framework
-
-| Property | Value |
-|----------|-------|
-| Framework | Shell script + curl (manual smoke test) |
-| Config file | None |
-| Quick run command | `act -j deploy` (with `act` CLI) |
-| Full suite command | Push to `main` branch |
-
-### Phase Requirements to Test Map
-
-| Req ID | Behavior | Test Type | Automated Command | File Exists? |
-|--------|----------|-----------|-------------------|-------------|
-| BG-06 | Pipeline runs full deploy-to-switch cycle | Integration | Push to `main` branch | `.github/workflows/deploy.yml` -- CREATE |
-| BG-07 | Docker image tagged with SHA, not `latest` | Assertion | `grep "github.sha" .github/workflows/deploy.yml` | YES after creation |
-| BG-08 | Lock file acquired before deploy, released after (if: always()) | Unit | Check lock step presence + `if: always()` | YES after creation |
-| BG-09 | All 4 Todo API endpoints return 2xx | Integration | Push to `main` branch (live smoke test) | YES after creation |
-
-### Wave 0 Gaps
-
-- `.github/workflows/deploy.yml` -- the pipeline file itself (the primary artifact)
-- `app/Dockerfile` -- copy from `multi-container-service/app/Dockerfile` (or clone in CI)
-- GitHub Secrets to create: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `EC2_SSH_PRIVATE_KEY`
-- GitHub Vars to create: `EC2_HOST` (= `13.236.205.122`)
+If flock is missing (unlikely on Ubuntu 22.04), fall back to the `mkdir`-based lock or install with `sudo apt-get install -y util-linux`.
 
 ---
 
 ## Sources
 
 ### Primary (HIGH confidence)
-
-- `C:\Users\fiefi\multi-container-service\.github\workflows\deploy.yml` -- Docker build-push, login-action, SSH key injection, workflow structure -- **CONFIRMED PROJECT PATTERN**
-- `C:\Users\fiefi\multi-container-service\.github\workflows\ci.yml` -- Docker metadata, buildx, login-action patterns -- **CONFIRMED PROJECT PATTERN**
-- `C:\Users\fiefi\blue-green-deployment\scripts\deploy.sh` -- SSH heredoc pattern, slot detection, port mapping -- **CONFIRMED DEPLOY LOGIC**
-- `C:\Users\fiefi\blue-green-deployment\scripts\switch-nginx.sh` -- Nginx switch via SSH, state file update -- **CONFIRMED SWITCH LOGIC**
-- `C:\Users\fiefi\blue-green-deployment\scripts\health-check.sh` -- Health polling via SSH curl -- **CONFIRMED HEALTH LOGIC**
-- `C:\Users\fiefi\blue-green-deployment\scripts\run-deploy.sh` -- Full orchestrator pattern -- **CONFIRMED PIPELINE SEQUENCE**
-- `docker/login-action` github.com/docker/login-action -- v3, OIDC support, Docker Hub + OCI registries
-- `docker/build-push-action` github.com/docker/build-push-action -- v6, `tags:`, `cache-from:`, `cache-to:`, `context:`, `file:` inputs
-- `docker/setup-buildx-action` github.com/docker/setup-buildx-action -- v3, BuildKit setup
-- `appleboy/ssh-action` github.com/appleboy/ssh-action -- v0.40.0, SSH execution marketplace action
+- GitHub Actions documentation — `concurrency:` block behavior, `cancel-in-progress`, group naming — https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#example-limiting-concurrency
+- GitHub Actions `appleboy/ssh-action` v0.40.0 — SSH execution marketplace action, key injection, timeout, `if: always()` support
+- util-linux flock(1) man page — atomic lock acquisition, `-w TIMEOUT` flag, file descriptor semantics
+- Phase 1 and Phase 2 scripts (`scripts/deploy.sh`, `scripts/health-check.sh`, `scripts/switch.sh`, `scripts/rollback.sh`, `scripts/run-deploy.sh`) — confirmed SSH patterns, slot calculation, Nginx switching, health check approach
+- Phase 2 research (`.planning/phases/02-deployment-automation/02-RESEARCH.md`) — locked decisions, phase requirements
+- STATE.md — current project state, accumulated context
+- REQUIREMENTS.md — BG-06, BG-07, BG-08, BG-09 requirement definitions
 
 ### Secondary (MEDIUM confidence)
-
-- GitHub Actions `concurrency` block documentation -- standard YAML configuration
-- `docker/metadata-action@v5` tag generation -- standard marketplace action
-- `flock` (util-linux) -- standard on Ubuntu 22.04 (GitHub Actions runner) and EC2
+- GitHub Actions runner OS differences (Windows `chmod` limitations, ssh-agent approach) — general knowledge, not project-verified
+- `mkdir`-based lock atomicity on POSIX — standard POSIX guarantees, widely documented
+- TTL selection (10 minutes for docker pull scenarios) — based on typical Docker image sizes and EC2 network speeds
 
 ### Tertiary (LOW confidence)
-
-- Exact `appleboy/ssh-action` v0.40.0 behavior -- verify against GitHub marketplace for latest version
-- Docker `type=gha` cache backend availability on `ubuntu-latest` -- verify that GitHub Actions Docker engine has `buildx` and GHA cache backend enabled
+- Specific flock version availability on Ubuntu 22.04 AMIs — not verified on the actual EC2 instance; plan should include pre-flight check
+- Windows runner SSH permission behavior — may vary by GitHub Actions runner image version
 
 ---
 
 ## Metadata
 
 **Confidence breakdown:**
-- Standard stack: HIGH -- all actions are official GitHub Actions or verified project patterns
-- Architecture: HIGH -- mirrors Phase 2 `run-deploy.sh` which is tested; confirmed in multi-container-service CI files
-- Pitfalls: HIGH -- identified from confirmed project artifacts and well-documented shell/SSH behaviors
-- Tag strategy: HIGH -- immutable tags are first-class GitHub Actions feature
-- Concurrency lock: HIGH -- `flock` + `concurrency` group is a known anti-concurrent-deploy pattern
+- GitHub Actions concurrency: HIGH — well-documented platform feature, directly applicable
+- EC2 locking (flock): HIGH — standard Linux tool, available on Ubuntu 22.04, tested approach
+- SSH secrets management: HIGH — standard GitHub Actions pattern, works with existing SSH infrastructure
+- Race condition handling: HIGH — TTL-based stale lock detection is a well-established pattern
+- Specific flock version on EC2: LOW — not verified on the actual instance; plan includes pre-flight check
 
 **Research date:** 2026-04-01
-**Valid until:** ~90 days for GitHub Actions (stable API); 30 days for action versions (check for newer major versions quarterly)
+**Valid until:** 2026-05-01 (GitHub Actions and flock are stable; no breaking changes expected in this domain)
