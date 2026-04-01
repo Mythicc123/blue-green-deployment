@@ -56,8 +56,7 @@ jobs:
             set -euo pipefail
             sudo mkdir -p /tmp/deploy
             # Clean up old lock artifacts from failed runs
-            rm -f /tmp/blue-green-deploy.lock 2>/dev/null || true
-            rmdir /tmp/blue-green-deploy.lock 2>/dev/null || true
+            rm -rf /tmp/blue-green-deploy.lock 2>/dev/null || true
             for script in get-active-slot.sh deploy.sh health-check.sh switch-nginx.sh run-deploy.sh; do
               if [[ -f "./scripts/$script" ]]; then
                 content=$(cat "./scripts/$script" | base64 -w0)
@@ -84,9 +83,8 @@ jobs:
             export GITHUB_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "=== Starting deployment (run $GITHUB_RUN_ID) ==="
 
-            # BG-08: Remove any leftover lock artifacts (handles both old file locks and lock dirs)
-            rm -f "$LOCKFILE" 2>/dev/null || true
-            rmdir "$LOCKFILE" 2>/dev/null || true
+            # BG-08: Remove any leftover lock artifacts
+            rm -rf "$LOCKFILE" 2>/dev/null || true
 
             # BG-08: Acquire lock using mkdir (atomic on all filesystems) + polling
             acquired=0
