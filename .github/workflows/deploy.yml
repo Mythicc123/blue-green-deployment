@@ -175,21 +175,22 @@ jobs:
           # POST /todos — create a todo
           RESPONSE=$(curl -s -X POST http://${HOST_IP}/todos \
             -H "Content-Type: application/json" \
-            -d '{"text":"ci-smoke-$(date +%s)","done":false}')
+            -d '{"title":"ci-smoke-$(date +%s)","done":false}')
           echo "POST /todos: $RESPONSE"
 
-          # Extract todo id
-          TODO_ID=$(echo "$RESPONSE" | grep -o '"_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+          # Extract todo id from MongoDB _id (nested object format: {"_id":{"$oid":"..."},"title":"..."})
+          TODO_ID=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('_id',{}).get('\$oid',d.get('id','')))" <<< "$RESPONSE")
           if [[ -z "$TODO_ID" ]]; then
-            echo "FAIL: Could not extract todo ID from POST response"
+            echo "FAIL: Could not extract todo ID from POST response: $RESPONSE"
             exit 1
           fi
+          echo "Created todo ID: $TODO_ID"
 
           # PUT /todos/:id — update
           PUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
             "http://${HOST_IP}/todos/${TODO_ID}" \
             -H "Content-Type: application/json" \
-            -d '{"text":"ci-smoke-updated","done":true}')
+            -d '{"title":"ci-smoke-updated","completed":true}')
           if [[ "$PUT_CODE" != "200" ]]; then echo "FAIL: PUT returned $PUT_CODE"; exit 1; fi
           echo "PASS: PUT /todos/${TODO_ID}"
 
