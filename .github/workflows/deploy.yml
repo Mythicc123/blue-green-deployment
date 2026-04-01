@@ -56,7 +56,6 @@ jobs:
             set -euo pipefail
             sudo mkdir -p /tmp/deploy
             # Clean up old lock artifacts from failed runs
-            rm -f /tmp/blue-green-deploy.lock
             rmdir /tmp/blue-green-deploy.lock 2>/dev/null || true
             for script in get-active-slot.sh deploy.sh health-check.sh switch-nginx.sh run-deploy.sh; do
               if [[ -f "./scripts/$script" ]]; then
@@ -84,8 +83,7 @@ jobs:
             export GITHUB_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "=== Starting deployment (run $GITHUB_RUN_ID) ==="
 
-            # BG-08: Clean stale locks from crashed/cancelled runs (remove any leftover lock artifacts)
-            rm -f "$LOCKFILE"
+            # BG-08: Clean stale locks from crashed/cancelled runs (remove any leftover lock dir)
             if [[ -d "$LOCKFILE" ]]; then
               ttl_at=$(grep '^TTL_AT=' "$LOCKFILE/data" 2>/dev/null | cut -d= -f2 || echo "")
               now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
