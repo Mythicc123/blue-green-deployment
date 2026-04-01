@@ -89,8 +89,18 @@ jobs:
               rm -f "$LOCKFILE"
             fi
 
-            # BG-08: Acquire EC2 lock using flock with path syntax (no explicit fd needed)
-            if ! flock "$LOCKFILE" -w "$LOCK_TIMEOUT" -c "echo LOCKED"; then
+            # BG-08: Acquire lock using noclobber + polling (no flock binary needed)
+            # Uses printf + redirection with set -C for atomic acquire, with timeout
+            acquired=0
+            deadline=$(($(date -u +%s) + LOCK_TIMEOUT))
+            while [[ $(date -u +%s) -lt $deadline ]]; do
+              if set -C && printf '%s\n' "LOCK_HELD=1" > "$LOCKFILE" 2>/dev/null; then
+                acquired=1
+                break
+              fi
+              sleep 2
+            done
+            if [[ $acquired -eq 0 ]]; then
               echo "ERROR: Could not acquire lock within ${LOCK_TIMEOUT}s"
               exit 1
             fi
