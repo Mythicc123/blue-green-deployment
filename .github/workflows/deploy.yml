@@ -81,20 +81,21 @@ jobs:
             export GITHUB_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "=== Starting deployment (run $GITHUB_RUN_ID) ==="
 
-            # BG-08: Clean stale locks from crashed/cancelled runs
-            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            ttl_at=$(grep '^TTL_AT=' "$LOCKFILE" 2>/dev/null | cut -d= -f2 || echo "")
-            if [[ -n "$ttl_at" && "$ttl_at" < "$now" ]]; then
-              echo "Cleaning stale lock (TTL expired: ${ttl_at})"
-              rm -f "$LOCKFILE"
+            # BG-08: Clean stale locks from crashed/cancelled runs (remove any leftover lock dir)
+            if [[ -d "$LOCKFILE" ]]; then
+              ttl_at=$(grep '^TTL_AT=' "$LOCKFILE/data" 2>/dev/null | cut -d= -f2 || echo "")
+              now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              if [[ -n "$ttl_at" && "$ttl_at" < "$now" ]]; then
+                echo "Cleaning stale lock (TTL expired: ${ttl_at})"
+                rmdir "$LOCKFILE"
+              fi
             fi
 
-            # BG-08: Acquire lock using noclobber + polling (no flock binary needed)
-            # Uses printf + redirection with set -C for atomic acquire, with timeout
+            # BG-08: Acquire lock using mkdir (atomic on all filesystems) + polling
             acquired=0
             deadline=$(($(date -u +%s) + LOCK_TIMEOUT))
             while [[ $(date -u +%s) -lt $deadline ]]; do
-              if set -C && printf '%s\n' "LOCK_HELD=1" > "$LOCKFILE" 2>/dev/null; then
+              if mkdir "$LOCKFILE" 2>/dev/null; then
                 acquired=1
                 break
               fi
@@ -104,6 +105,7 @@ jobs:
               echo "ERROR: Could not acquire lock within ${LOCK_TIMEOUT}s"
               exit 1
             fi
+
             MY_PID=$$
             MY_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -116,7 +118,7 @@ jobs:
               "GITHUB_RUN_ID=${GITHUB_RUN_ID}" \
               "GITHUB_RUN_URL=${GITHUB_RUN_URL}" \
               "TTL_AT=${ttl_at}" \
-              > "$LOCKFILE"
+              > "$LOCKFILE/data"
             echo "LOCK ACQUIRED: PID=${MY_PID} TTL_AT=${ttl_at}"
 
             # BG-06: Run the full deploy pipeline using Phase 2 scripts
@@ -125,7 +127,7 @@ jobs:
 
             # BG-08: Release lock — only if deploy succeeded
             if [[ $DEPLOY_STATUS -eq 0 ]]; then
-              rm -f "$LOCKFILE"
+              rmdir "$LOCKFILE"
               echo "LOCK RELEASED"
             else
               echo "WARNING: Deploy failed (exit $DEPLOY_STATUS) — lock NOT released (TTL will clean it)"
