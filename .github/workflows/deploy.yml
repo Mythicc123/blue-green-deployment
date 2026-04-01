@@ -45,29 +45,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Install deploy scripts on EC2 (one-time setup)
-      - name: Install deploy scripts on EC2
-        uses: appleboy/ssh-action@v1.2.5
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            sudo mkdir -p /tmp/deploy
-            # Clean up old lock artifacts from failed runs
-            rm -rf /tmp/blue-green-deploy.lock 2>/dev/null || true
-            for script in get-active-slot.sh deploy.sh health-check.sh switch-nginx.sh run-deploy.sh; do
-              if [[ -f "./scripts/$script" ]]; then
-                content=$(cat "./scripts/$script" | base64 -w0)
-                echo "$content" | base64 -d | sudo tee "/tmp/deploy/$script" > /dev/null
-                sudo chmod +x "/tmp/deploy/$script"
-                echo "Installed: /tmp/deploy/$script"
-              fi
-            done
-          timeout: 60s
-
       # BG-06 + BG-08: Full deploy pipeline with EC2 lock
+      # Runs entirely inline — no script upload needed
       - name: Run blue-green deployment
         uses: appleboy/ssh-action@v1.2.5
         with:
@@ -116,19 +95,64 @@ jobs:
               > "$LOCKFILE/data"
             echo "LOCK ACQUIRED: PID=${MY_PID} TTL_AT=${ttl_at}"
 
-            # BG-06: Run the full deploy pipeline using Phase 2 scripts
-            IMAGE_TAG=sha-${{ github.sha }} bash /tmp/deploy/run-deploy.sh
-            DEPLOY_STATUS=$?
+            # BG-06: Determine active slot and deploy inline
+            IMAGE_TAG=sha-${{ github.sha }}
+            ACTIVE_SLOT=$(cat /var/run/blue-green-state 2>/dev/null || echo blue)
+            if [[ "$ACTIVE_SLOT" == "blue" ]]; then
+              INACTIVE_SLOT=green
+              INACTIVE_PORT=3002
+            else
+              INACTIVE_SLOT=blue
+              INACTIVE_PORT=3001
+            fi
+            echo "Active slot: $ACTIVE_SLOT"
+            echo "Deploying to inactive slot: $INACTIVE_SLOT (port $INACTIVE_PORT)"
+
+            # BG-06: Pull and start the new version
+            echo "[Deploy] Pulling $IMAGE_TAG to $INACTIVE_SLOT..."
+            cd /opt/"$INACTIVE_SLOT"
+            DOCKER_IMAGE=$(grep DOCKER_IMAGE .env | cut -d= -f2)
+            # Override the image tag in .env
+            sed -i "s|DOCKER_IMAGE=.*|DOCKER_IMAGE=mythicc123/multi-container-service:${IMAGE_TAG}|" .env
+            docker compose pull
+            docker compose up -d
+            echo "[Deploy] Deployed."
+
+            # BG-06: Health check (poll until healthy or 60s timeout)
+            echo "[Health] Checking $INACTIVE_SLOT health..."
+            HEALTH_URL="http://localhost:${INACTIVE_PORT}/health"
+            waited=0
+            while [[ $waited -lt 60 ]]; do
+              if curl -sf "$HEALTH_URL" | grep -q '"status":"ok"'; then
+                echo "[Health] PASS after ${waited}s"
+                break
+              fi
+              sleep 3
+              waited=$((waited + 3))
+            done
+            if [[ $waited -ge 60 ]]; then
+              echo "[Health] FAIL: timed out after 60s"
+              DEPLOY_STATUS=1
+            fi
+
+            # BG-06: Switch Nginx
+            if [[ $waited -lt 60 ]]; then
+              echo "[Nginx] Switching to $INACTIVE_SLOT..."
+              sudo ln -sf /etc/nginx/sites-available/blue-green-${INACTIVE_SLOT}.conf /etc/nginx/sites-enabled/blue-green
+              sudo nginx -t
+              sudo nginx -s reload
+              echo "$INACTIVE_SLOT" | sudo tee /var/run/blue-green-state > /dev/null
+              echo "[Nginx] Switched to $INACTIVE_SLOT"
+            fi
 
             # BG-08: Release lock — only if deploy succeeded
-            if [[ $DEPLOY_STATUS -eq 0 ]]; then
-              rmdir "$LOCKFILE"
+            if [[ $? -eq 0 ]]; then
+              rm -rf "$LOCKFILE"
               echo "LOCK RELEASED"
             else
-              echo "WARNING: Deploy failed (exit $DEPLOY_STATUS) — lock NOT released (TTL will clean it)"
+              echo "WARNING: Deploy failed — lock NOT released (TTL will clean it)"
             fi
-            exit $DEPLOY_STATUS
-          envs: IMAGE_TAG
+            exit ${DEPLOY_STATUS:-0}
           timeout: 15m
 
       # BG-09: Basic smoke test — verify API responds after Nginx switch
