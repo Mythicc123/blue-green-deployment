@@ -60,8 +60,8 @@
 8. Full deploy-to-switch cycle tested manually on EC2
 
 **Plans:** 2 plans
-- [ ] 02-01-PLAN.md — Deploy scripts, health check, switch Nginx
-- [ ] 02-02-PLAN.md — Rollback script, state tracking, log access
+- [x] 02-01-PLAN.md — Deploy scripts, health check, switch Nginx, run-deploy orchestrator
+- [x] 02-02-PLAN.md — Rollback script, log access
 
 ---
 
