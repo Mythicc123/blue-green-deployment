@@ -28,14 +28,14 @@
 
 ### Rollback
 
-- [ ] **BG-10**: Manual rollback — SSH script that reads `/var/run/blue-green-state`, flips Nginx symlink to the other slot, runs `nginx -s reload`. No container rebuild needed.
+- [x] **BG-10**: Manual rollback — SSH script that reads `/var/run/blue-green-state`, flips Nginx symlink to the other slot, runs `nginx -s reload`. No container rebuild needed.
 - [ ] **BG-11**: Old slot stays alive — after switch, the previously active environment keeps running. Rollback is instant Nginx reload, not a full redeploy.
 
 ### Monitoring (Bonus)
 
 - [ ] **BG-12**: Health check endpoints — `/health` endpoint on the API verifies MongoDB connectivity, not just container liveness.
-- [ ] **BG-13**: Container log access — `docker compose logs` readable via SSH or CI/CD.
-- [ ] **BG-14**: Nginx access log monitoring — logs in `/var/log/nginx/access.log`, readable and queryable.
+- [x] **BG-13**: Container log access — `docker compose logs` readable via SSH or CI/CD.
+- [x] **BG-14**: Nginx access log monitoring — logs in `/var/log/nginx/access.log`, readable and queryable.
 
 ## Out of Scope
 
