@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Initialized
-stopped_at: Project initialized
-last_updated: "2026-04-01T03:00:00.000Z"
+status: In Progress
+stopped_at: Phase 1 Foundation complete — both blue and green running, Nginx switching verified
+last_updated: "2026-04-01T05:05:00.000Z"
 progress:
   total_phases: 3
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 0
+  completed_plans: 2
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: PROJECT.md
 
 **Core value:** Zero-downtime deployments — users experience no interruption when a new version is released.
-**Current focus:** Phase 1 — Foundation
+**Current focus:** Phase 2 — Deployment Automation
 
 ## Current Position
 
-Phase: 1 (Foundation) — Not started
-Plan: 1 of 2
+Phase: 1 (Foundation) — **Completed**
+Plan: All 2 plans complete
 
 ## Accumulated Context
 
@@ -35,13 +35,23 @@ Plan: 1 of 2
 - Same EC2 instance: Blue-green runs on 13.236.205.122 alongside multi-container-service.
 - IP only: No domain/R53 for v1.
 - Basic monitoring: Health checks, container logs, Nginx logs only.
+- Docker network: Blue-green containers use multi-container-service Docker network (external: true) to reach shared MongoDB via container DNS name `multi-container-service-mongo-1:27017`
+- Health endpoint: Enhanced to verify MongoDB connectivity using `db.command({ping:1})`
+- Multi-container-service moved to port 8080 (from 80) to free port 80 for blue-green Nginx
 
 ### Blockers/Concerns
 
-None yet.
+None.
+
+### EC2 State
+
+- blue-api: 3001, green-api: 3002, multi-container API: 3000, multi-container MongoDB: 27017
+- Nginx routes port 80 → active blue-green environment
+- Nginx routes port 8080 → multi-container-service
+- All /health endpoints return `{"status":"ok","mongo":"connected"}`
 
 ## Session Continuity
 
 Last session: 2026-04-01
-Stopped at: Project initialized
-Resume file: PROJECT.md
+Stopped at: Phase 1 Foundation complete
+Resume file: ROADMAP.md
