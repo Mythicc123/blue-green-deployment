@@ -83,8 +83,8 @@
 7. Deployment lock file prevents CI and manual deploys from colliding
 8. Full pipeline tested end-to-end with a real commit
 
-**Plans:** 2 plans
-- [ ] 03-01-PLAN.md — GitHub Actions deploy workflow
+**Plans:** 1/2 plans executed
+- [x] 03-01-PLAN.md — GitHub Actions deploy workflow
 - [ ] 03-02-PLAN.md — Smoke test, concurrency lock, immutable tagging
 
 ---
@@ -95,7 +95,7 @@
 |-------|---------------|--------|-----------|
 | 1. Foundation | 0/2 | Not started | - |
 | 2. Deployment Automation | 2/2 | Complete | 2026-04-01 |
-| 3. CI/CD Pipeline | 0/2 | Not started | - |
+| 3. CI/CD Pipeline | 1/2 | In Progress|  |
 
 ---
 

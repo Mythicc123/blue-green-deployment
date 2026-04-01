@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Ready to plan
-stopped_at: Completed 02-02-PLAN.md rollback and log scripts
-last_updated: "2026-04-01T05:35:10.025Z"
+status: Ready to execute
+stopped_at: Completed 03-ci-cd-pipeline-03-01 plan
+last_updated: "2026-04-01T06:39:23.588Z"
 progress:
   total_phases: 3
   completed_phases: 1
-  total_plans: 4
-  completed_plans: 2
+  total_plans: 6
+  completed_plans: 3
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: PROJECT.md
 
 **Core value:** Zero-downtime deployments — users experience no interruption when a new version is released.
-**Current focus:** Phase 02 — deployment-automation
+**Current focus:** Phase 03 — ci-cd-pipeline
 
 ## Current Position
 
-Phase: 3
-Plan: Not started
+Phase: 03 (ci-cd-pipeline) — EXECUTING
+Plan: 2 of 2
 
 ## Accumulated Context
 
@@ -38,6 +38,9 @@ Plan: Not started
 - Docker network: Blue-green containers use multi-container-service Docker network (external: true) to reach shared MongoDB via container DNS name `multi-container-service-mongo-1:27017`
 - Health endpoint: Enhanced to verify MongoDB connectivity using `db.command({ping:1})`
 - Multi-container-service moved to port 8080 (from 80) to free port 80 for blue-green Nginx
+- [Phase 03-ci-cd-pipeline]: Inline flock lock logic in appleboy/ssh-action script block; ec2-lock.sh is standalone utility for manual diagnostics
+- [Phase 03-ci-cd-pipeline]: Lock NOT released on deploy failure; only TTL (10 min) cleans stale locks from crashed runs
+- [Phase 03-ci-cd-pipeline]: Phase 2 scripts installed on EC2 via base64 encoding in appleboy/ssh-action before deploy step
 
 ### Blockers/Concerns
 
@@ -52,6 +55,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-04-01T05:26:26.501Z
-Stopped at: Completed 02-02-PLAN.md rollback and log scripts
+Last session: 2026-04-01T06:39:23.585Z
+Stopped at: Completed 03-ci-cd-pipeline-03-01 plan
 Resume file: None
