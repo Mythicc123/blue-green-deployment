@@ -65,20 +65,6 @@ jobs:
             done
           timeout: 60s
 
-      # BG-08: Create lock acquisition script on EC2 (avoids nested heredoc issues)
-      - name: Prepare lock script on EC2
-        uses: appleboy/ssh-action@v1.2.5
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            printf '#!/usr/bin/env bash\nset -euo pipefail\nLOCKFILE="/tmp/blue-green-deploy.lock"\nLOCK_TIMEOUT="${LOCK_TIMEOUT:-300}"\nLOCK_TTL="${LOCK_TTL:-600}"\nrun_id="${GITHUB_RUN_ID:-local}"\nrun_url="${GITHUB_RUN_URL:--}"\nmy_hostname=$(hostname -f 2>/dev/null || hostname)\nnow=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\nttl_at=$(date -u -d "+${LOCK_TTL} seconds" +%%Y-%%m-%%dT%%H:%%M:%%SZ 2>/dev/null || date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\necho "Acquiring lock..."\nflock -w "${LOCK_TIMEOUT}" 9 || { echo "ERROR: Could not acquire lock"; exit 1; }\nprintf "%%s\\n" "LOCK_HELD=1" "PID=$$" "HOSTNAME=${my_hostname}" "ACQUIRED_AT=${now}" "GITHUB_RUN_ID=${run_id}" "GITHUB_RUN_URL=${run_url}" "TTL_AT=${ttl_at}" > "${LOCKFILE}"\necho "LOCK ACQUIRED"\n' > /tmp/acquire-lock.sh
-            chmod +x /tmp/acquire-lock.sh
-            echo "Lock script created"
-          timeout: 30s
-
       # BG-06 + BG-08: Full deploy pipeline with EC2 lock
       - name: Run blue-green deployment
         uses: appleboy/ssh-action@v1.2.5
@@ -103,8 +89,11 @@ jobs:
               rm -f "$LOCKFILE"
             fi
 
-            # BG-08: Acquire EC2 lock with flock + TTL
-            flock -w "$LOCK_TIMEOUT" 9 || { echo "ERROR: Could not acquire lock within ${LOCK_TIMEOUT}s"; exit 1; }
+            # BG-08: Acquire EC2 lock using flock with path syntax (no explicit fd needed)
+            if ! flock "$LOCKFILE" -w "$LOCK_TIMEOUT" -c "echo LOCKED"; then
+              echo "ERROR: Could not acquire lock within ${LOCK_TIMEOUT}s"
+              exit 1
+            fi
             MY_PID=$$
             MY_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
