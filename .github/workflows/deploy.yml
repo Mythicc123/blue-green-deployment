@@ -3,7 +3,8 @@ name: Deploy to EC2 (Blue-Green)
 on:
   push:
     branches:
-      - main
+      - master
+  workflow_dispatch:
 
 # BG-08: Concurrency control — cancels in-progress run when new push arrives
 concurrency:
