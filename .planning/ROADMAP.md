@@ -85,7 +85,7 @@
 
 **Plans:** 1/2 plans executed
 - [x] 03-01-PLAN.md — GitHub Actions deploy workflow
-- [ ] 03-02-PLAN.md — Smoke test, concurrency lock, immutable tagging
+- [x] 03-02-PLAN.md — Smoke test, concurrency lock, immutable tagging
 
 ---
 

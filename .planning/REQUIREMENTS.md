@@ -24,7 +24,7 @@
 - [x] **BG-06**: Automated CI/CD pipeline on push — GitHub Actions `deploy.yml` triggers on push to main. Steps: determine active slot, deploy to inactive slot, health check, Nginx switch, smoke test.
 - [x] **BG-07**: Immutable Docker image tags — images tagged with git SHA (e.g., `v1.0.0-sha-abc1234`), never `latest`. Each deploy is reproducible.
 - [x] **BG-08**: Concurrency lock — GitHub Actions concurrency group prevents simultaneous deployments. Deployment lock file on EC2 (`/tmp/blue-green-deploy.lock`) as secondary protection.
-- [ ] **BG-09**: Smoke test after switch — CI/CD calls Todo API endpoints (GET/POST/PUT/DELETE) through the public IP after Nginx switch to confirm full path works.
+- [x] **BG-09**: Smoke test after switch — CI/CD calls Todo API endpoints (GET/POST/PUT/DELETE) through the public IP after Nginx switch to confirm full path works.
 
 ### Rollback
 
