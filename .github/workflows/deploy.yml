@@ -132,27 +132,22 @@ jobs:
             done
             if [[ $waited -ge 60 ]]; then
               echo "[Health] FAIL: timed out after 60s"
-              DEPLOY_STATUS=1
+              rm -rf "$LOCKFILE"
+              exit 1
             fi
 
             # BG-06: Switch Nginx
-            if [[ $waited -lt 60 ]]; then
-              echo "[Nginx] Switching to $INACTIVE_SLOT..."
-              sudo ln -sf /etc/nginx/sites-available/blue-green-${INACTIVE_SLOT}.conf /etc/nginx/sites-enabled/blue-green
-              sudo nginx -t
-              sudo nginx -s reload
-              echo "$INACTIVE_SLOT" | sudo tee /var/run/blue-green-state > /dev/null
-              echo "[Nginx] Switched to $INACTIVE_SLOT"
-            fi
+            echo "[Nginx] Switching to $INACTIVE_SLOT..."
+            sudo ln -sf /etc/nginx/sites-available/blue-green-${INACTIVE_SLOT}.conf /etc/nginx/sites-enabled/blue-green
+            sudo nginx -t
+            sudo nginx -s reload
+            echo "$INACTIVE_SLOT" | sudo tee /var/run/blue-green-state > /dev/null
+            echo "[Nginx] Switched to $INACTIVE_SLOT"
 
-            # BG-08: Release lock — only if deploy succeeded
-            if [[ $? -eq 0 ]]; then
-              rm -rf "$LOCKFILE"
-              echo "LOCK RELEASED"
-            else
-              echo "WARNING: Deploy failed — lock NOT released (TTL will clean it)"
-            fi
-            exit ${DEPLOY_STATUS:-0}
+            # BG-08: Release lock
+            rm -rf "$LOCKFILE"
+            echo "LOCK RELEASED"
+            exit 0
           timeout: 15m
 
       # BG-09: Basic smoke test — verify API responds after Nginx switch
@@ -173,13 +168,14 @@ jobs:
           echo "PASS: GET /todos"
 
           # POST /todos — create a todo
+          TODO_TEXT="ci-smoke-$(date +%s)"
           RESPONSE=$(curl -s -X POST http://${HOST_IP}/todos \
             -H "Content-Type: application/json" \
-            -d '{"title":"ci-smoke-$(date +%s)","done":false}')
+            -d "{\"title\":\"${TODO_TEXT}\",\"completed\":false}")
           echo "POST /todos: $RESPONSE"
 
-          # Extract todo id from MongoDB _id (nested object format: {"_id":{"$oid":"..."},"title":"..."})
-          TODO_ID=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('_id',{}).get('\$oid',d.get('id','')))" <<< "$RESPONSE")
+          # Extract todo id
+          TODO_ID=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('_id','') or d.get('id',''))" <<< "$RESPONSE")
           if [[ -z "$TODO_ID" ]]; then
             echo "FAIL: Could not extract todo ID from POST response: $RESPONSE"
             exit 1
